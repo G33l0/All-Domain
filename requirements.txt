@@ -2,4 +2,7 @@ pyfiglet
 colorama
 idna
 aiohttp
+aiosqlite
+aiofiles
 builtwith
+rich
