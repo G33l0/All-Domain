@@ -1,8 +1,7 @@
-pyfiglet
-colorama
-idna
 aiohttp
 aiosqlite
 aiofiles
 builtwith
+idna
+pyfiglet
 rich
