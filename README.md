@@ -1,4 +1,4 @@
-#🌐 Domain Collector
+# 🌐 Domain Collector
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python Version">
@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/contributions-welcome-orange.svg" alt="Contributions Welcome">
 </p>
 
-Autonomous, asynchronous domain intelligence & technology fingerprinting framework
+> *Autonomous, asynchronous domain intelligence & technology fingerprinting framework*
 
 ---
 
