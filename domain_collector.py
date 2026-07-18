@@ -23,6 +23,7 @@ from rich import box
 from rich.align import Align
 from rich.prompt import Prompt, Confirm
 from rich.markdown import Markdown
+import aioconsole
 
 from builtwith import builtwith
 
@@ -33,7 +34,7 @@ OUTPUT_DIR = "output"
 # ==================== CONFIGURATION (mutable) ====================
 class Config:
     def __init__(self):
-        self.concurrency = 30          # reduced for iSH/portable
+        self.concurrency = 30
         self.http_timeout = 10
         self.fetch_interval = 3600
         self.user_agent = "Mozilla/5.0 (compatible; DomainRecon/2.0)"
@@ -150,7 +151,8 @@ async def fetch_crt(session: aiohttp.ClientSession) -> List[str]:
                             if d and not d.startswith('*.'):
                                 domains.add(d)
                 return list(domains)
-    except:
+            return []
+    except Exception:
         return []
 
 # ==================== UI ====================
@@ -169,6 +171,7 @@ class LiveUI:
         self.running = True
         self.lock = asyncio.Lock()
         self._banner_text = self._render_banner()
+        self.paused_for_input = False  # flag to freeze UI while reading commands
 
     def _render_banner(self) -> str:
         term_width = shutil.get_terminal_size().columns
@@ -221,6 +224,8 @@ class LiveUI:
             Layout(name="table", ratio=1)
         )
         status = "⏸️ PAUSED" if config.paused else "▶️ RUNNING"
+        if self.paused_for_input:
+            status = "⌨️ WAITING FOR COMMAND"
         stats_text = (
             f"{status} | "
             f"Processed: {self.stats['processed']} | "
@@ -263,8 +268,9 @@ class LiveUI:
     async def run_ui(self):
         with Live(self.render(), console=self.console, refresh_per_second=2, screen=True) as live:
             while self.running:
+                if not self.paused_for_input:
+                    live.update(self.render())
                 await asyncio.sleep(0.5)
-                live.update(self.render())
 
 # ==================== COMMAND HANDLER ====================
 class CommandHandler:
@@ -286,7 +292,6 @@ class CommandHandler:
 - `quit`    – stop the tool
 """))
         elif cmd == "config":
-            # Show config menu
             self.ui.console.print("\n[bold cyan]Configuration Menu[/] (press Enter to keep current value)")
             new_concurrency = Prompt.ask(f"Concurrency (current: {config.concurrency})", default=str(config.concurrency))
             new_interval = Prompt.ask(f"Fetch interval (seconds) (current: {config.fetch_interval})", default=str(config.fetch_interval))
@@ -298,7 +303,6 @@ class CommandHandler:
                 config.fetch_interval = int(new_interval)
                 config.http_timeout = int(new_timeout)
                 config.tech_detection = tech_detect
-                # Update semaphore in collector
                 self.collector.sem = asyncio.Semaphore(config.concurrency)
                 self.ui.add_log(f"Configuration updated: concurrency={config.concurrency}, interval={config.fetch_interval}, timeout={config.http_timeout}, tech_detection={config.tech_detection}")
                 self.ui.console.print("[green]Configuration updated successfully![/]")
@@ -339,15 +343,18 @@ class CommandHandler:
             self.ui.console.print("[red]Unknown command. Type 'help' for available commands.[/]")
 
     async def input_loop(self):
-        loop = asyncio.get_running_loop()
-        while self.running:
+        while self.running and self.ui.running:
+            # Pause UI updates while we read input
+            self.ui.paused_for_input = True
             try:
-                cmd = await loop.run_in_executor(None, sys.stdin.readline)
-                if not cmd:
-                    break
-                await self.handle_command(cmd.strip())
+                cmd = await aioconsole.ainput("> ")  # shows prompt at bottom
             except asyncio.CancelledError:
                 break
+            finally:
+                self.ui.paused_for_input = False
+            if not cmd:
+                continue
+            await self.handle_command(cmd)
 
 # ==================== MAIN COLLECTOR ====================
 class DomainCollector:
@@ -379,7 +386,6 @@ class DomainCollector:
                         break
                     except Exception as e:
                         self.ui.add_log(f"Producer error: {e}")
-                # Sleep in small intervals to allow config changes and cancellation
                 for _ in range(config.fetch_interval):
                     if not self.ui.running:
                         break
@@ -412,14 +418,10 @@ class DomainCollector:
                         self.queue.task_done()
 
     async def run(self):
-        # Start UI
         ui_task = asyncio.create_task(self.ui.run_ui())
-        # Start command handler
         cmd_handler = CommandHandler(self.ui, self)
         input_task = asyncio.create_task(cmd_handler.input_loop())
-        # Start producer
         producer_task = asyncio.create_task(self.producer())
-        # Start consumers
         consumers = [asyncio.create_task(self.consumer(i)) for i in range(config.concurrency // 2)]
         self.tasks = [ui_task, input_task, producer_task] + consumers
 
