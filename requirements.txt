@@ -5,3 +5,4 @@ builtwith
 idna
 pyfiglet
 rich
+aioconsole
