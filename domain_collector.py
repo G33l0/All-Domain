@@ -26,6 +26,10 @@ from rich.markdown import Markdown
 
 from builtwith import builtwith
 
+# ==================== CONSTANTS ====================
+DB_PATH = "domains.db"
+OUTPUT_DIR = "output"
+
 # ==================== CONFIGURATION (mutable) ====================
 class Config:
     def __init__(self):
