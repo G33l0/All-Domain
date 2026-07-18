@@ -1,54 +1,28 @@
-#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import scrolledtext, ttk, messagebox
+import threading
 import asyncio
 import aiohttp
 import aiosqlite
 import aiofiles
+import sqlite3
 import os
-import sys
 import json
 import idna
-import shutil
-import time
 from datetime import datetime
-from typing import List, Dict, Set
 from collections import defaultdict
-import sqlite3
-
-from pyfiglet import Figlet
-from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.layout import Layout
-from rich.text import Text
-from rich import box
-from rich.align import Align
-from rich.prompt import Prompt, Confirm
-from rich.markdown import Markdown
-import aioconsole
-
 from builtwith import builtwith
 
-# ==================== CONSTANTS ====================
+# ========== CONFIG ==========
 DB_PATH = "domains.db"
 OUTPUT_DIR = "output"
+CONCURRENCY = 20
+HTTP_TIMEOUT = 10
+FETCH_INTERVAL = 1800  # seconds
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-# ==================== CONFIGURATION ====================
-class Config:
-    def __init__(self):
-        self.concurrency = 20
-        self.http_timeout = 10
-        self.fetch_interval = 1800
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        self.max_queue_size = 5000
-        self.log_limit = 30
-        self.paused = False
-        self.tech_detection = True
-
-config = Config()
-
-# ==================== UTILITIES ====================
-def domain_fingerprint(raw: str) -> str:
+# ========== CORE LOGIC ==========
+def domain_fingerprint(raw):
     raw = raw.split('://')[-1].split('/')[0].split(':')[0]
     try:
         raw = idna.encode(raw).decode('ascii')
@@ -56,14 +30,13 @@ def domain_fingerprint(raw: str) -> str:
         raw = raw.lower()
     return raw.rstrip('.').lower()
 
-# ==================== DATABASE ====================
 class DomainStore:
     def __init__(self):
-        self._seen: Set[str] = set()
+        self._seen = set()
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        self._init_db_sync()
+        self._init_db()
 
-    def _init_db_sync(self):
+    def _init_db(self):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS domains (
@@ -75,15 +48,14 @@ class DomainStore:
                 )
             ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_fingerprint ON domains(fingerprint)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_responsive ON domains(responsive)')
             conn.commit()
             cur = conn.execute('SELECT fingerprint FROM domains')
             self._seen = {row[0] for row in cur}
 
-    async def is_new(self, fp: str) -> bool:
+    async def is_new(self, fp):
         return fp not in self._seen
 
-    async def add_domain(self, raw: str, fp: str, responsive: bool, techs: List[str]):
+    async def add_domain(self, raw, fp, responsive, techs):
         if fp in self._seen:
             return False
         tech_json = json.dumps(techs) if techs else None
@@ -101,36 +73,33 @@ class DomainStore:
             except aiosqlite.IntegrityError:
                 return False
 
-    async def _write_tech_files(self, domain: str, techs: List[str]):
+    async def _write_tech_files(self, domain, techs):
         for tech in techs:
             safe = "".join(c for c in tech if c.isalnum() or c in (' ', '-', '_')).strip() or "unknown"
             fpath = os.path.join(OUTPUT_DIR, f"{safe}.txt")
             async with aiofiles.open(fpath, 'a', encoding='utf-8') as f:
                 await f.write(domain + '\n')
 
-# ==================== HTTP CHECKER ====================
-async def check_domain(session: aiohttp.ClientSession, domain: str):
+async def check_domain(session, domain):
     techs = []
     responsive = False
     for scheme in ('https', 'http'):
         url = f"{scheme}://{domain}"
         try:
-            async with session.get(url, timeout=config.http_timeout, allow_redirects=True) as resp:
+            async with session.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True) as resp:
                 if resp.status < 400:
                     responsive = True
-                    if config.tech_detection:
-                        html = await resp.text(errors='ignore', limit=200_000)
-                        detected = builtwith(html, url=url)
-                        for _, items in detected.items():
-                            techs.extend(items)
+                    html = await resp.text(errors='ignore', limit=200_000)
+                    detected = builtwith(html, url=url)
+                    for _, items in detected.items():
+                        techs.extend(items)
                     if techs:
                         break
         except:
             continue
     return responsive, list(set(techs))
 
-# ==================== DOMAIN SOURCES ====================
-async def fetch_crt(session: aiohttp.ClientSession, limit=200) -> List[str]:
+async def fetch_crt(session, limit=200):
     url = f"https://crt.sh/?q=%.&output=json&excluded=expired&limit={limit}"
     try:
         async with session.get(url, timeout=15) as resp:
@@ -146,10 +115,9 @@ async def fetch_crt(session: aiohttp.ClientSession, limit=200) -> List[str]:
                                 domains.add(d)
                 return list(domains)
     except:
-        pass
-    return []
+        return []
 
-async def fetch_fallback(session: aiohttp.ClientSession) -> List[str]:
+async def fetch_fallback(session):
     url = "https://raw.githubusercontent.com/publicsuffix/list/master/public_suffix_list.dat"
     try:
         async with session.get(url, timeout=10) as resp:
@@ -162,278 +130,209 @@ async def fetch_fallback(session: aiohttp.ClientSession) -> List[str]:
                         domains.append(line)
                 return domains[:500]
     except:
-        pass
-    return []
+        return []
 
-# ==================== PRODUCER ====================
-class DomainProducer:
-    def __init__(self, store: DomainStore, ui, queue: asyncio.Queue):
-        self.store = store
-        self.ui = ui
-        self.queue = queue
+# ========== GUI APPLICATION ==========
+class DomainCollectorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Domain Collector")
+        self.root.geometry("900x700")
+        self.root.resizable(True, True)
+        self.running = False
+        self.paused = False
+        self.store = DomainStore()
+        self.queue = asyncio.Queue(maxsize=5000)
+        self.stats = {"processed": 0, "responsive": 0, "new": 0, "tech_counts": defaultdict(int)}
+        self.tasks = []
+        self.loop = None
+
+        # UI Layout
+        top_frame = tk.Frame(root)
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Button(top_frame, text="Start", command=self.start, bg="lightgreen", width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Pause", command=self.pause, bg="lightyellow", width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Resume", command=self.resume, bg="lightblue", width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Stop", command=self.stop, bg="lightcoral", width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Config", command=self.config_dialog, width=10).pack(side=tk.LEFT, padx=5)
+
+        self.status_label = tk.Label(top_frame, text="Status: Stopped", font=("Arial", 10, "bold"), fg="gray")
+        self.status_label.pack(side=tk.RIGHT, padx=10)
+
+        # Stats frame
+        stats_frame = tk.Frame(root)
+        stats_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.stats_labels = {}
+        for key in ["Processed", "Responsive", "New", "Queue"]:
+            lbl = tk.Label(stats_frame, text=f"{key}: 0", font=("Arial", 10))
+            lbl.pack(side=tk.LEFT, padx=10)
+            self.stats_labels[key] = lbl
+
+        # Main area: left = tech table, right = log
+        main_frame = tk.Frame(root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        main_frame.grid_columnconfigure(0, weight=2)
+        main_frame.grid_columnconfigure(1, weight=1)
+        main_frame.grid_rowconfigure(0, weight=1)
+
+        # Tech table (left)
+        tech_frame = tk.LabelFrame(main_frame, text="Technologies", font=("Arial", 10, "bold"))
+        tech_frame.grid(row=0, column=0, sticky="nsew", padx=5)
+        self.tech_tree = ttk.Treeview(tech_frame, columns=("count",), show="tree headings", height=20)
+        self.tech_tree.heading("#0", text="Technology")
+        self.tech_tree.heading("count", text="Domains")
+        self.tech_tree.column("#0", width=200)
+        self.tech_tree.column("count", width=80, anchor="center")
+        scroll_tech = tk.Scrollbar(tech_frame, orient=tk.VERTICAL, command=self.tech_tree.yview)
+        self.tech_tree.configure(yscrollcommand=scroll_tech.set)
+        self.tech_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_tech.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Log (right)
+        log_frame = tk.LabelFrame(main_frame, text="Activity Log", font=("Arial", 10, "bold"))
+        log_frame.grid(row=0, column=1, sticky="nsew", padx=5)
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Consolas", 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        # Footer
+        footer = tk.Label(root, text="All domains saved to domains.db and output/*.txt", font=("Arial", 8), fg="gray")
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=2)
+
+    def log(self, msg, color="black"):
+        self.log_text.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} - {msg}\n")
+        self.log_text.see(tk.END)
+        # Optional: color tags (we skip for simplicity)
+
+    def update_stats(self):
+        self.stats_labels["Processed"].config(text=f"Processed: {self.stats['processed']}")
+        self.stats_labels["Responsive"].config(text=f"Responsive: {self.stats['responsive']}")
+        self.stats_labels["New"].config(text=f"New: {self.stats['new']}")
+        self.stats_labels["Queue"].config(text=f"Queue: {self.queue.qsize() if hasattr(self, 'queue') else 0}")
+        # Update tech tree
+        self.tech_tree.delete(*self.tech_tree.get_children())
+        for tech, count in sorted(self.stats["tech_counts"].items(), key=lambda x: x[1], reverse=True)[:20]:
+            self.tech_tree.insert("", tk.END, text=tech, values=(count,))
+
+    def start(self):
+        if self.running:
+            return
         self.running = True
-        self.retry_count = 0
+        self.paused = False
+        self.status_label.config(text="Status: Running", fg="green")
+        self.log("Started collection.")
+        # Run async loop in a separate thread
+        def run_loop():
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            self.loop = asyncio.get_event_loop()
+            self.loop.run_until_complete(self.main_loop())
 
-    async def run(self):
-        async with aiohttp.ClientSession(headers={'User-Agent': config.user_agent}) as session:
+        threading.Thread(target=run_loop, daemon=True).start()
+
+    def pause(self):
+        if not self.running:
+            return
+        self.paused = True
+        self.status_label.config(text="Status: Paused", fg="orange")
+        self.log("Paused.")
+
+    def resume(self):
+        if not self.running:
+            return
+        self.paused = False
+        self.status_label.config(text="Status: Running", fg="green")
+        self.log("Resumed.")
+
+    def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        self.status_label.config(text="Status: Stopped", fg="gray")
+        self.log("Stopping...")
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+    def config_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Configuration")
+        dialog.geometry("300x250")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        # Concurrency
+        tk.Label(dialog, text="Concurrency:").pack(pady=5)
+        con_entry = tk.Entry(dialog)
+        con_entry.insert(0, str(CONCURRENCY))
+        con_entry.pack()
+        # Fetch interval
+        tk.Label(dialog, text="Fetch interval (seconds):").pack(pady=5)
+        int_entry = tk.Entry(dialog)
+        int_entry.insert(0, str(FETCH_INTERVAL))
+        int_entry.pack()
+        # Timeout
+        tk.Label(dialog, text="HTTP timeout (seconds):").pack(pady=5)
+        to_entry = tk.Entry(dialog)
+        to_entry.insert(0, str(HTTP_TIMEOUT))
+        to_entry.pack()
+
+        def save_config():
+            global CONCURRENCY, FETCH_INTERVAL, HTTP_TIMEOUT
+            try:
+                CONCURRENCY = int(con_entry.get())
+                FETCH_INTERVAL = int(int_entry.get())
+                HTTP_TIMEOUT = int(to_entry.get())
+                messagebox.showinfo("Success", "Configuration updated.\nRestart to apply changes.")
+                dialog.destroy()
+            except ValueError:
+                messagebox.showerror("Error", "Please enter valid numbers.")
+
+        tk.Button(dialog, text="Save", command=save_config).pack(pady=10)
+
+    # ========== ASYNC CORE ==========
+    async def main_loop(self):
+        # Producer
+        producer_task = asyncio.create_task(self.producer())
+        # Consumers
+        consumers = [asyncio.create_task(self.consumer(i)) for i in range(CONCURRENCY)]
+        self.tasks = [producer_task] + consumers
+        try:
+            await asyncio.gather(*self.tasks)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            for t in self.tasks:
+                t.cancel()
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    async def producer(self):
+        async with aiohttp.ClientSession(headers={'User-Agent': USER_AGENT}) as session:
             while self.running:
-                if not config.paused:
+                if not self.paused:
                     try:
                         domains = await fetch_crt(session, limit=200)
                         if not domains:
-                            self.ui.add_log("crt.sh empty, trying fallback...")
+                            self.log("crt.sh empty, using fallback...")
                             domains = await fetch_fallback(session)
                         if domains:
-                            self.ui.add_log(f"Fetched {len(domains)} new domains")
+                            self.log(f"Fetched {len(domains)} new domains")
                             for d in domains:
                                 fp = domain_fingerprint(d)
                                 if await self.store.is_new(fp):
                                     await self.queue.put((d, fp))
-                            self.ui.stats["queue"] = self.queue.qsize()
-                            self.retry_count = 0
-                        else:
-                            self.retry_count += 1
-                            self.ui.add_log(f"No domains fetched (attempt {self.retry_count})")
-                            await asyncio.sleep(min(60, 5 * self.retry_count))
+                            # Update queue size in stats
+                            self.stats["queue"] = self.queue.qsize()
+                            self.root.after(0, self.update_stats)
                     except Exception as e:
-                        self.ui.add_log(f"Producer error: {e}")
-                for _ in range(config.fetch_interval):
+                        self.log(f"Producer error: {e}")
+                # Sleep in small steps for responsiveness
+                for _ in range(FETCH_INTERVAL):
                     if not self.running:
                         break
                     await asyncio.sleep(1)
 
-    def stop(self):
-        self.running = False
-
-# ==================== UI ====================
-class LiveUI:
-    def __init__(self, store: DomainStore):
-        self.store = store
-        self.console = Console()
-        self.stats = {
-            "processed": 0,
-            "responsive": 0,
-            "new": 0,
-            "queue": 0,
-            "tech_counts": defaultdict(int),
-        }
-        self.logs: List[str] = []
-        self.running = True
-        self.lock = asyncio.Lock()
-        self.paused_for_input = False
-        self._banner = self._render_banner()
-        self.awaiting_start = True
-
-    def _render_banner(self) -> str:
-        width = min(shutil.get_terminal_size().columns, 80)
-        fig = Figlet(font="small", width=width)
-        return fig.renderText("Domain Collector")
-
-    def add_log(self, msg: str, color: str = "white"):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.logs.append(f"[{ts}] {msg}")
-        if len(self.logs) > config.log_limit:
-            self.logs.pop(0)
-
-    async def update_stats(self, responsive: bool, techs: List[str], inserted: bool):
-        async with self.lock:
-            self.stats["processed"] += 1
-            if inserted:
-                self.stats["new"] += 1
-            if responsive:
-                self.stats["responsive"] += 1
-                for t in techs:
-                    self.stats["tech_counts"][t] += 1
-
-    def render(self) -> Layout:
-        layout = Layout()
-        layout.split_column(
-            Layout(name="header", size=5),
-            Layout(name="body", ratio=1),
-            Layout(name="footer", size=3)
-        )
-        # Header - simple title
-        header_panel = Panel(
-            Align.center(Text(self._banner, style="bold cyan")),
-            border_style="blue",
-            box=box.SIMPLE
-        )
-        layout["header"].update(header_panel)
-
-        # Body
-        body = Layout()
-        body.split_row(
-            Layout(name="left", ratio=2),
-            Layout(name="right", ratio=1)
-        )
-        left = Layout()
-        left.split_column(
-            Layout(name="stats", size=5),
-            Layout(name="table", ratio=1)
-        )
-        # Stats
-        if self.paused_for_input:
-            status = "⌨️ COMMAND"
-        elif self.awaiting_start:
-            status = "⏳ WAITING"
-        else:
-            status = "⏸ PAUSED" if config.paused else "▶ RUNNING"
-
-        stats_text = (
-            f"{status}  |  Proc: {self.stats['processed']}  |  "
-            f"Live: {self.stats['responsive']}  |  New: {self.stats['new']}  |  Queue: {self.stats['queue']}"
-        )
-        stats_panel = Panel(Align.center(stats_text), title="📊 Stats", border_style="green", box=box.SIMPLE)
-        left["stats"].update(stats_panel)
-
-        # Tech table
-        table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
-        table.add_column("Technology", style="cyan")
-        table.add_column("Domains", justify="right", style="yellow")
-        sorted_techs = sorted(self.stats["tech_counts"].items(), key=lambda x: x[1], reverse=True)
-        for tech, count in sorted_techs[:15]:
-            table.add_row(tech, str(count))
-        if not sorted_techs:
-            table.add_row("(waiting)", "0")
-        table_panel = Panel(table, title="🏷️ Technologies", border_style="blue", box=box.SIMPLE)
-        left["table"].update(table_panel)
-
-        # Log panel
-        log_text = "\n".join(self.logs[-config.log_limit:]) if self.logs else "No activity yet..."
-        log_panel = Panel(
-            Align.left(log_text),
-            title="📋 Activity Log",
-            border_style="yellow",
-            box=box.SIMPLE
-        )
-        body["left"].update(left)
-        body["right"].update(log_panel)
-        layout["body"].update(body)
-
-        # Footer
-        footer = Panel(
-            Align.center("[bold]start | pause | resume | config | status | exit[/]"),
-            border_style="grey50",
-            box=box.SIMPLE
-        )
-        layout["footer"].update(footer)
-        return layout
-
-    async def run_ui(self):
-        with Live(self.render(), console=self.console, refresh_per_second=2, screen=True) as live:
+    async def consumer(self, worker_id):
+        async with aiohttp.ClientSession(headers={'User-Agent': USER_AGENT}) as session:
             while self.running:
-                if not self.paused_for_input:
-                    live.update(self.render())
-                await asyncio.sleep(0.5)
-
-# ==================== COMMAND HANDLER ====================
-class CommandHandler:
-    def __init__(self, ui: LiveUI, producer: DomainProducer, collector):
-        self.ui = ui
-        self.producer = producer
-        self.collector = collector
-        self.running = True
-
-    async def handle_command(self, cmd: str):
-        cmd = cmd.strip().lower()
-        if not cmd:
-            return
-
-        if cmd == "start":
-            if self.ui.awaiting_start:
-                self.ui.awaiting_start = False
-                self.ui.add_log("▶️ Started processing")
-            else:
-                self.ui.add_log("Already running")
-        elif cmd == "pause":
-            if not self.ui.awaiting_start:
-                if not config.paused:
-                    config.paused = True
-                    self.ui.add_log("⏸️ Paused")
-                else:
-                    self.ui.add_log("Already paused")
-            else:
-                self.ui.add_log("Not started yet")
-        elif cmd == "resume":
-            if config.paused:
-                config.paused = False
-                self.ui.add_log("▶️ Resumed")
-            else:
-                self.ui.add_log("Not paused")
-        elif cmd == "config":
-            # Temporarily stop UI updates while showing prompts
-            self.ui.paused_for_input = True
-            self.ui.console.print("\n[bold cyan]Configuration Menu[/] (press Enter to keep current)")
-            new_concurrency = Prompt.ask(f"Concurrency (current: {config.concurrency})", default=str(config.concurrency))
-            new_interval = Prompt.ask(f"Fetch interval (s) (current: {config.fetch_interval})", default=str(config.fetch_interval))
-            new_timeout = Prompt.ask(f"Timeout (s) (current: {config.http_timeout})", default=str(config.http_timeout))
-            tech_detect = Confirm.ask(f"Tech detection? (current: {config.tech_detection})", default=config.tech_detection)
-            self.ui.paused_for_input = False
-            try:
-                config.concurrency = int(new_concurrency)
-                config.fetch_interval = int(new_interval)
-                config.http_timeout = int(new_timeout)
-                config.tech_detection = tech_detect
-                self.collector.sem = asyncio.Semaphore(config.concurrency)
-                self.ui.add_log(f"Config updated: concurrency={config.concurrency}, interval={config.fetch_interval}, timeout={config.http_timeout}, tech_detection={config.tech_detection}")
-                self.ui.console.print("[green]✅ Configuration updated[/]")
-            except ValueError:
-                self.ui.console.print("[red]Invalid input, numbers required.[/]")
-        elif cmd == "status":
-            self.ui.console.print(f"""
-[bold]Current Configuration[/]
-  Concurrency:       {config.concurrency}
-  Fetch interval:    {config.fetch_interval}s
-  HTTP timeout:      {config.http_timeout}s
-  Tech detection:    {config.tech_detection}
-  Paused:            {config.paused}
-  Queue size:        {self.ui.stats['queue']}
-  Processed:         {self.ui.stats['processed']}
-  Responsive:        {self.ui.stats['responsive']}
-  New domains:       {self.ui.stats['new']}
-""")
-        elif cmd in ("exit", "quit"):
-            self.ui.add_log("Shutting down...")
-            self.ui.running = False
-            self.running = False
-            self.producer.stop()
-            self.collector.shutdown()
-        else:
-            self.ui.add_log(f"Unknown command: {cmd}", color="red")
-
-    async def input_loop(self):
-        while self.running and self.ui.running:
-            self.ui.paused_for_input = True
-            try:
-                cmd = await aioconsole.ainput("> ")
-            except asyncio.CancelledError:
-                break
-            finally:
-                self.ui.paused_for_input = False
-            if not cmd:
-                continue
-            await self.handle_command(cmd)
-
-# ==================== MAIN COLLECTOR ====================
-class DomainCollector:
-    def __init__(self):
-        self.store = DomainStore()
-        self.ui = LiveUI(self.store)
-        self.queue = asyncio.Queue(maxsize=config.max_queue_size)
-        self.sem = asyncio.Semaphore(config.concurrency)
-        self.producer = DomainProducer(self.store, self.ui, self.queue)
-        self.tasks = []
-
-    def shutdown(self):
-        self.ui.running = False
-        self.producer.stop()
-        for t in self.tasks:
-            t.cancel()
-
-    async def consumer(self, worker_id: int):
-        async with aiohttp.ClientSession(headers={'User-Agent': config.user_agent}) as session:
-            while self.ui.running:
-                if config.paused or self.ui.awaiting_start:
+                if self.paused:
                     await asyncio.sleep(1)
                     continue
                 try:
@@ -442,47 +341,28 @@ class DomainCollector:
                     continue
                 except asyncio.CancelledError:
                     break
-                async with self.sem:
-                    try:
-                        responsive, techs = await check_domain(session, raw)
-                        inserted = await self.store.add_domain(raw, fp, responsive, techs)
-                        await self.ui.update_stats(responsive, techs, inserted)
-                        if inserted:
-                            color = "green" if responsive else "red"
-                            tech_str = ", ".join(techs) if techs else "none"
-                            self.ui.add_log(f"{raw} → {'✓' if responsive else '✗'} {tech_str}", color=color)
-                        self.ui.stats["queue"] = self.queue.qsize()
-                    except Exception as e:
-                        self.ui.add_log(f"Error: {raw} - {e}", color="red")
-                    finally:
-                        self.queue.task_done()
+                try:
+                    responsive, techs = await check_domain(session, raw)
+                    inserted = await self.store.add_domain(raw, fp, responsive, techs)
+                    if inserted:
+                        self.stats["processed"] += 1
+                        if responsive:
+                            self.stats["responsive"] += 1
+                            for t in techs:
+                                self.stats["tech_counts"][t] += 1
+                        self.stats["new"] += 1
+                        color = "green" if responsive else "red"
+                        tech_str = ", ".join(techs) if techs else "none"
+                        self.log(f"{raw} → {'✓' if responsive else '✗'} {tech_str}")
+                        self.root.after(0, self.update_stats)
+                    self.stats["queue"] = self.queue.qsize()
+                except Exception as e:
+                    self.log(f"Error processing {raw}: {e}")
+                finally:
+                    self.queue.task_done()
 
-    async def run(self):
-        ui_task = asyncio.create_task(self.ui.run_ui())
-        cmd_task = asyncio.create_task(CommandHandler(self.ui, self.producer, self).input_loop())
-        producer_task = asyncio.create_task(self.producer.run())
-        consumers = [asyncio.create_task(self.consumer(i)) for i in range(config.concurrency)]
-        self.tasks = [ui_task, cmd_task, producer_task] + consumers
-
-        self.ui.add_log("Press Enter to start, or type 'pause', 'config', 'exit'")
-
-        try:
-            await asyncio.gather(*self.tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            for t in self.tasks:
-                t.cancel()
-            await asyncio.gather(*self.tasks, return_exceptions=True)
-            self.ui.running = False
-
-# ==================== ENTRY ====================
-async def main():
-    collector = DomainCollector()
-    await collector.run()
-
+# ========== MAIN ==========
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[+] Shutdown complete.")
+    root = tk.Tk()
+    app = DomainCollectorApp(root)
+    root.mainloop()
