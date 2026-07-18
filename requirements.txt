@@ -1,0 +1,5 @@
+pyfiglet
+colorama
+idna
+aiohttp
+builtwith
