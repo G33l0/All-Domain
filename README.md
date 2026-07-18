@@ -1,12 +1,15 @@
 🌐 Domain Collector
 
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python Version">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
+  <img src="https://img.shields.io/badge/status-active-brightgreen" alt="Status">
+  <img src="https://img.shields.io/badge/contributions-welcome-orange.svg" alt="Contributions Welcome">
+</p>
+
 Autonomous, asynchronous domain intelligence & technology fingerprinting framework
 
 ---
-
-https://img.shields.io/badge/python-3.8+-blue.svg
-https://img.shields.io/badge/license-MIT-green.svg
-https://img.shields.io/badge/status-active-brightgreen
 
 Domain Collector continuously discovers live domains from public sources, checks their responsiveness, detects their technology stack, and organises them into technology-specific files – all with zero duplication.
 
