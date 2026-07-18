@@ -18,10 +18,15 @@ Domain Collector continuously discovers live domains from public sources, checks
 🎯 What it does
 
 · 🔍 Discovers domains from public feeds (Certificate Transparency logs, DNS zones, etc.)
+
 · ✅ Validates each domain via HTTP/HTTPS (drops unreachable ones)
+
 · 🧬 Fingerprints the technology stack (web servers, frameworks, CMS, analytics, etc.)
+
 · 📁 Saves results into output/<technology>.txt – one domain per line, in real‑time
+
 · 🛡️ Deduplicates using cryptographic-style fingerprints – no domain ever stored twice
+
 · ⚡ Asynchronous architecture for high‑speed processing with configurable concurrency
 
 ---
