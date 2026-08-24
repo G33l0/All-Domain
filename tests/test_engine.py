@@ -1,0 +1,369 @@
+"""Engine tests against a real local HTTP server."""
+
+import asyncio
+
+import aiohttp
+import pytest_asyncio
+from aiohttp import web
+
+from domaincollector.config import Config
+from domaincollector.engine import Collector, probe_domain
+from domaincollector.sources import Source
+from domaincollector.store import DomainStore
+
+HTML = (
+    '<html><head><meta name="generator" content="WordPress 6.4.2">'
+    '<script src="/wp-content/themes/x/jquery-3.6.0.min.js"></script></head><body>hi</body></html>'
+)
+
+
+async def _handler(request):
+    if request.path == "/missing":
+        return web.Response(status=404, text="nope", headers={"Server": "nginx/1.24.0"})
+    if request.path == "/big":
+        return web.Response(text="x" * (2 * 1024 * 1024), headers={"Server": "nginx/1.24.0"})
+    if request.path == "/slow":
+        await asyncio.sleep(5)
+        return web.Response(text="late")
+    return web.Response(
+        text=HTML,
+        headers={"Server": "nginx/1.24.0", "X-Powered-By": "PHP/8.2.1",
+                 "Set-Cookie": "PHPSESSID=abc; Path=/"},
+    )
+
+
+@pytest_asyncio.fixture
+async def server():
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", _handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = runner.addresses[0][1]
+    try:
+        yield f"127.0.0.1:{port}"
+    finally:
+        await runner.cleanup()
+
+
+@pytest_asyncio.fixture
+async def session():
+    async with aiohttp.ClientSession() as client:
+        yield client
+
+
+async def test_probe_detects_technologies_over_http(server, session):
+    result = await probe_domain(session, server, Config(http_timeout=5))
+    assert result.responsive and result.reached
+    assert result.status_code == 200
+    assert result.scheme == "http"  # https is tried first and fails
+    assert {"Nginx", "PHP", "WordPress", "jQuery"} <= set(result.technologies)
+    assert result.versions["WordPress"] == "6.4.2"
+    assert result.elapsed_ms >= 0
+
+
+async def test_probe_keeps_fingerprints_from_error_responses(server, session):
+    result = await probe_domain(session, f"{server}/missing", Config(http_timeout=5))
+    assert result.reached is True
+    assert result.responsive is False
+    assert result.status_code == 404
+    assert "Nginx" in result.technologies
+
+
+async def test_probe_caps_the_body_size(server, session):
+    config = Config(http_timeout=10, max_body_bytes=2048)
+    result = await probe_domain(session, f"{server}/big", config)
+    assert result.responsive is True  # no TypeError, no runaway download
+
+
+async def test_probe_reports_unreachable_hosts(session):
+    result = await probe_domain(session, "127.0.0.1:1", Config(http_timeout=3))
+    assert result.responsive is False
+    assert result.reached is False
+    assert result.error
+    assert "ssl:" not in result.error  # error text stays readable
+
+
+async def test_probe_reports_timeouts(server, session):
+    result = await probe_domain(session, f"{server}/slow", Config(http_timeout=1))
+    assert result.responsive is False
+    assert result.error == "timeout"
+
+
+class StubSource(Source):
+    name = "stub"
+
+    def __init__(self, domains, **kwargs):
+        kwargs.setdefault("user_agent", "test")
+        super().__init__(**kwargs)
+        self.domains = list(domains)
+        self.calls = 0
+
+    async def fetch(self, session, limit):
+        self.calls += 1
+        return self.domains[:limit]
+
+
+class FailingSource(Source):
+    name = "broken"
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("user_agent", "test")
+        super().__init__(**kwargs)
+        self.calls = 0
+
+    async def fetch(self, session, limit):
+        from domaincollector.sources import SourceError
+
+        self.calls += 1
+        raise SourceError("feed is down")
+
+
+async def test_full_cycle_persists_results(tmp_path, server):
+    config = Config(
+        concurrency=4, http_timeout=5, fetch_interval=10, max_domains_per_cycle=3,
+        db_path=str(tmp_path / "d.db"), output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"),
+    ).validate()
+    events = []
+    source = StubSource(["example.com", "example.org", "example.net"], cache_dir=str(tmp_path))
+    # point every candidate at the local server
+    collector = Collector(config, on_event=events.append, sources=[source])
+
+    original_probe = probe_domain
+
+    async def patched(session, domain, cfg, ssl_arg=None):
+        return await original_probe(session, server, cfg, ssl_arg)
+
+    import domaincollector.engine as engine_module
+
+    engine_module.probe_domain = patched
+    try:
+        stats = await collector.run(cycles=1)
+    finally:
+        engine_module.probe_domain = original_probe
+
+    assert stats.processed == 3
+    assert stats.responsive == 3
+    assert stats.new == 3
+    assert stats.errors == 0
+    assert stats.tech_counts["WordPress"] == 3
+
+    store = DomainStore(config.db_path, config.output_dir)
+    await store.open()
+    try:
+        assert (await store.summary())["total"] == 3
+        assert set(await store.domains_for_technology("WordPress")) == {
+            "example.com", "example.org", "example.net"}
+    finally:
+        await store.close()
+    assert (tmp_path / "out" / "WordPress.txt").exists()
+    assert any(event.kind == "cycle" for event in events)
+
+
+async def test_failing_source_is_cooled_down_not_fatal(tmp_path):
+    config = Config(
+        concurrency=2, fetch_interval=10, db_path=str(tmp_path / "d.db"),
+        output_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "cache"),
+    ).validate()
+    events = []
+    source = FailingSource(cache_dir=str(tmp_path))
+    collector = Collector(config, on_event=events.append, sources=[source])
+    stats = await collector.run(cycles=1)
+    assert stats.processed == 0
+    assert stats.source_fail["broken"] == 1
+    assert any("unavailable" in event.message for event in events if event.kind == "log")
+    assert collector.running is False
+
+
+async def test_duplicates_are_never_queued_twice(tmp_path):
+    config = Config(
+        concurrency=2, fetch_interval=10, max_domains_per_cycle=10,
+        db_path=str(tmp_path / "d.db"), output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"),
+    ).validate()
+    source = StubSource(["dup.com", "dup.com", "DUP.com", "https://dup.com/x"], cache_dir=str(tmp_path))
+    collector = Collector(config, sources=[source])
+
+    async def never_reachable(session, domain, cfg, ssl_arg=None):
+        from domaincollector.engine import ProbeResult
+
+        return ProbeResult(responsive=False, error="stubbed")
+
+    import domaincollector.engine as engine_module
+
+    original = engine_module.probe_domain
+    engine_module.probe_domain = never_reachable
+    try:
+        stats = await collector.run(cycles=1)
+    finally:
+        engine_module.probe_domain = original
+
+    assert stats.processed == 1
+    assert stats.duplicates == 3
+
+
+async def test_stop_shuts_everything_down(tmp_path):
+    config = Config(
+        concurrency=3, fetch_interval=3600, max_domains_per_cycle=1,
+        db_path=str(tmp_path / "d.db"), output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"),
+    ).validate()
+    source = StubSource(["stop.example"], cache_dir=str(tmp_path))
+    collector = Collector(config, sources=[source])
+
+    async def stub(session, domain, cfg, ssl_arg=None):
+        from domaincollector.engine import ProbeResult
+
+        return ProbeResult(responsive=False, error="stubbed")
+
+    import domaincollector.engine as engine_module
+
+    original = engine_module.probe_domain
+    engine_module.probe_domain = stub
+    task = asyncio.create_task(collector.run())
+    try:
+        await asyncio.sleep(0.5)
+        collector.stop()
+        stats = await asyncio.wait_for(task, timeout=15)
+    finally:
+        engine_module.probe_domain = original
+
+    assert collector.running is False
+    assert stats.cycles >= 1
+    leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert not [t for t in leftover if "consumer" in (t.get_name() or "")]
+
+
+async def test_pause_and_resume(tmp_path):
+    config = Config(
+        concurrency=1, fetch_interval=3600, db_path=str(tmp_path / "d.db"),
+        output_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "cache"),
+    ).validate()
+    collector = Collector(config, sources=[StubSource([], cache_dir=str(tmp_path))])
+    collector.pause()
+    assert collector.paused is True
+    collector.resume()
+    assert collector.paused is False
+
+
+async def _run_one_cycle(collector, probe):
+    import domaincollector.engine as engine_module
+
+    original = engine_module.probe_domain
+    engine_module.probe_domain = probe
+    try:
+        return await collector.run(cycles=1)
+    finally:
+        engine_module.probe_domain = original
+
+
+def _recheck_config(tmp_path, **overrides):
+    settings = dict(
+        concurrency=2, http_timeout=5, fetch_interval=10, max_domains_per_cycle=5,
+        db_path=str(tmp_path / "d.db"), output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"),
+    )
+    settings.update(overrides)
+    return Config(**settings).validate()
+
+
+async def test_stale_domains_are_requeued_and_updated(tmp_path):
+    import sqlite3
+
+    from domaincollector.engine import ProbeResult
+
+    config = _recheck_config(tmp_path, recheck_after=3600, recheck_batch=10)
+    source = StubSource(["site.example"], cache_dir=str(tmp_path))
+
+    async def first_probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(responsive=True, reached=True, status_code=200,
+                           scheme="https", technologies=["Nginx"], versions={"Nginx": "1.0"})
+
+    stats = await _run_one_cycle(Collector(config, sources=[source]), first_probe)
+    assert stats.new == 1 and stats.rechecked == 0
+
+    # Age the row so it is due for a re-check.
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute("UPDATE domains SET checked_at = '2000-01-01 00:00:00'")
+        conn.commit()
+
+    async def second_probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(responsive=True, reached=True, status_code=200,
+                           scheme="https", technologies=["Apache"], versions={"Apache": "2.4"})
+
+    # The source offers nothing new, so everything probed is a re-check.
+    empty_source = StubSource([], cache_dir=str(tmp_path))
+    stats = await _run_one_cycle(Collector(config, sources=[empty_source]), second_probe)
+    assert stats.rechecked == 1
+    assert stats.new == 0
+    assert stats.processed == 1
+
+    store = DomainStore(config.db_path, config.output_dir)
+    await store.open()
+    try:
+        assert (await store.summary())["total"] == 1  # updated, not duplicated
+        assert await store.top_technologies() == [("Apache", 1)]
+        assert await store.stale_domains(3600, 10) == []
+    finally:
+        await store.close()
+
+
+async def test_rechecking_is_off_by_default(tmp_path):
+    import sqlite3
+
+    from domaincollector.engine import ProbeResult
+
+    config = _recheck_config(tmp_path)
+    assert config.recheck_after == 0
+
+    async def probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(responsive=True, reached=True, status_code=200, technologies=[])
+
+    await _run_one_cycle(Collector(config, sources=[StubSource(["a.example"], cache_dir=str(tmp_path))]), probe)
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute("UPDATE domains SET checked_at = '2000-01-01 00:00:00'")
+        conn.commit()
+
+    stats = await _run_one_cycle(Collector(config, sources=[StubSource([], cache_dir=str(tmp_path))]), probe)
+    assert stats.processed == 0
+    assert stats.rechecked == 0
+
+
+async def test_recheck_batch_limits_the_queue(tmp_path):
+    import sqlite3
+
+    from domaincollector.engine import ProbeResult
+
+    config = _recheck_config(tmp_path, recheck_after=3600, recheck_batch=2)
+
+    async def probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(responsive=True, reached=True, status_code=200, technologies=[])
+
+    seeds = [f"s{i}.example" for i in range(5)]
+    await _run_one_cycle(Collector(config, sources=[StubSource(seeds, cache_dir=str(tmp_path))]), probe)
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute("UPDATE domains SET checked_at = '2000-01-01 00:00:00'")
+        conn.commit()
+
+    stats = await _run_one_cycle(Collector(config, sources=[StubSource([], cache_dir=str(tmp_path))]), probe)
+    assert stats.rechecked == 2
+
+
+async def test_sources_are_closed_on_shutdown(tmp_path):
+    config = _recheck_config(tmp_path)
+
+    class ClosableSource(StubSource):
+        name = "closable"
+
+        def __init__(self, **kwargs):
+            super().__init__([], **kwargs)
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    source = ClosableSource(cache_dir=str(tmp_path))
+    await Collector(config, sources=[source]).run(cycles=1)
+    assert source.closed is True

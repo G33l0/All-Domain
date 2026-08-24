@@ -1,156 +1,291 @@
 # 🌐 Domain Collector
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python Version">
+  <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/status-active-brightgreen" alt="Status">
-  <img src="https://img.shields.io/badge/contributions-welcome-orange.svg" alt="Contributions Welcome">
+  <img src="https://img.shields.io/badge/tests-140%20passing-brightgreen" alt="Tests">
 </p>
 
 > *Autonomous, asynchronous domain intelligence & technology fingerprinting framework*
 
 ---
 
-Domain Collector continuously discovers live domains from public sources, checks their responsiveness, detects their technology stack, and organises them into technology-specific files – all with zero duplication.
+Domain Collector continuously discovers domains from public feeds, checks whether they
+answer over HTTP/HTTPS, fingerprints the technology stack behind them, and files the
+results into a SQLite database and technology-specific text files — with no duplicates.
+
+It runs either as a **desktop GUI** or **fully headless in a terminal**.
 
 ---
 
-🎯 What it does
+## 🎯 What it does
 
-· 🔍 Discovers domains from public feeds (Certificate Transparency logs, DNS zones, etc.)
-
-· ✅ Validates each domain via HTTP/HTTPS (drops unreachable ones)
-
-· 🧬 Fingerprints the technology stack (web servers, frameworks, CMS, analytics, etc.)
-
-· 📁 Saves results into output/<technology>.txt – one domain per line, in real‑time
-
-· 🛡️ Deduplicates using cryptographic-style fingerprints – no domain ever stored twice
-
-· ⚡ Asynchronous architecture for high‑speed processing with configurable concurrency
-
----
-
-✨ Features
-
-Feature Description
-Continuous operation Runs indefinitely, periodically refreshing from multiple sources
-Real‑time output Each responsive domain is immediately written to its technology file(s)
-Responsive check Tries both HTTP and HTTPS; marks domains as responsive on 2xx/3xx
-Tech detection Uses builtwith to identify frameworks, libraries, servers, and more
-Deduplication SQLite backend with UNIQUE fingerprint constraint – guaranteed no dupes
-Adaptive banner Professional welcome screen that fits any terminal size
-Logging & stats Periodic progress logs (every 1000 domains processed)
-Extensible Easily add new domain sources by extending the producer
+- 🔍 **Discovers** domains from several public feeds — Certificate Transparency in real
+  time over a **certstream websocket**, crt.sh searches, the Tranco / Cisco Umbrella /
+  Majestic ranking lists, or your own seed file
+- ✅ **Validates** every candidate (punycode, label rules, TLD sanity, no IPs or wildcards)
+  before a single request is made
+- 🌐 **Probes** each domain over HTTPS, falling back to HTTP
+- 🧬 **Fingerprints** the stack — web servers, CDNs, CMSs, frameworks, JS libraries,
+  analytics, security headers — from response headers, cookies, `<meta>` tags and HTML,
+  including version numbers where they are exposed
+- 📁 **Writes** `output/<technology>.txt` in real time, one domain per line
+- 🔁 **Re-checks** stored domains on a schedule, so the dataset tracks stacks that change
+- 🛡️ **Deduplicates** in memory *and* in SQLite, so a domain is never probed or stored twice
+- ⚡ **Scales** with configurable concurrency and a bounded work queue
 
 ---
 
-📦 Installation
+## 📦 Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/G33l0/All-Domain.git
 cd All-Domain
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-Requirements: Python 3.8+ and the packages listed in requirements.txt.
+Requirements: **Python 3.9+**, `aiohttp`, `aiosqlite`, `idna`.
 
----
-
-🚀 Usage
-
-Start the collector:
+The GUI additionally needs Tk, which some Python builds ship separately:
 
 ```bash
+sudo apt install python3-tk      # Debian / Ubuntu
+sudo dnf install python3-tkinter # Fedora
+```
+
+Without Tk the collector still runs — it just goes straight to headless mode.
+
+---
+
+## 🚀 Usage
+
+```bash
+# Desktop GUI (falls back to headless if Tk is missing)
 python domain_collector.py
+
+# Headless, runs until you press Ctrl+C
+python domain_collector.py --headless
+
+# One fetch cycle of 100 domains, 50 at a time, then exit
+python domain_collector.py --headless --once --limit 100 --concurrency 50
+
+# Feed it your own list instead of the public sources
+python domain_collector.py --headless --sources file --seed-file my-domains.txt
+
+# Live Certificate Transparency stream (see the certstream note below)
+python domain_collector.py --headless --sources certstream \
+    --certstream-url ws://127.0.0.1:8080/domains-only
+
+# Discover new domains and re-check anything last seen over a day ago
+python domain_collector.py --headless --recheck-after 86400 --recheck-batch 200
+
+# Re-check only: refresh what is already stored, discover nothing new
+python domain_collector.py --headless --recheck-after 86400 --recheck-only
+
+# Inspect what has been collected so far
+python domain_collector.py --stats
+python domain_collector.py --export WordPress > wordpress-sites.txt
 ```
 
-Press Ctrl+C at any time to stop gracefully.
+`Ctrl+C` stops gracefully: in-flight probes finish, buffered rows are flushed, the
+database and HTTP sessions are closed. Press it twice to force an immediate exit.
+
+### Command line options
+
+| Option | Description |
+|---|---|
+| `--headless`, `--no-gui` | Run in the terminal instead of opening the GUI |
+| `--once` / `--cycles N` | Stop after one / N fetch cycles |
+| `--concurrency N` | Simultaneous probes (default 20) |
+| `--timeout SECONDS` | Per-request timeout (default 10) |
+| `--interval SECONDS` | Delay between fetch cycles (default 1800) |
+| `--limit N` | Max domains queued per cycle (default 500) |
+| `--sources LIST` | `crtsh`, `certstream`, `tranco`, `umbrella`, `majestic`, `file` (comma separated) |
+| `--seed-file PATH` | Local file of candidate domains, one per line |
+| `--certstream-url URL` | Certstream websocket to stream CT logs from |
+| `--recheck-after SECONDS` | Re-probe stored domains older than this (`0` disables) |
+| `--recheck-batch N` | How many stale domains to re-queue per cycle |
+| `--recheck-only` | Refresh stored domains only, discover nothing new |
+| `--db PATH` / `--output DIR` | Database and technology-file locations |
+| `--responsive-only` | Store only domains that answered |
+| `--no-tech-files` | Database only, skip `output/*.txt` |
+| `--verify-ssl` | Verify TLS certificates (off by default — many live hosts have broken chains) |
+| `--use-builtwith` | Additionally run the optional legacy `builtwith` package |
+| `--stats` / `--export TECH` | Report on the database, then exit |
+| `--save-config` | Write the resulting settings to the config file and exit |
+| `-c`, `--config PATH` | Config file to use (default `config.json`) |
 
 ---
 
-⚙️ Configuration
+## ⚙️ Configuration
 
-All settings are at the top of domain_collector.py – tweak them to your needs, if you got the version work interactive ui expect to set the config within the application:
+Settings live in `config.json` (created by `--save-config` or by the GUI's **Settings**
+dialog). Command line flags override the file for a single run.
 
-Variable Default Description
-CONCURRENCY 50 Number of simultaneous HTTP checks
-HTTP_TIMEOUT 10 Timeout (seconds) for each request
-FETCH_INTERVAL 3600 How often to re‑fetch from sources (seconds)
-MAX_QUEUE_SIZE 10000 Maximum in‑memory queue size
-DB_PATH domains.db SQLite database location
-OUTPUT_DIR output Directory for technology files
+| Key | Default | Description |
+|---|---|---|
+| `concurrency` | `20` | Simultaneous HTTP probes |
+| `http_timeout` | `10` | Timeout in seconds for each request |
+| `fetch_interval` | `1800` | Seconds between fetch cycles |
+| `max_queue_size` | `10000` | Bounded in-memory work queue |
+| `max_domains_per_cycle` | `500` | How many candidates to queue per cycle |
+| `max_body_bytes` | `262144` | Hard cap on how much HTML is downloaded per domain |
+| `db_path` | `domains.db` | SQLite database |
+| `output_dir` | `output` | Technology text files |
+| `cache_dir` | `.cache` | Cached ranking lists and feed positions |
+| `sources` | `["crtsh","tranco","umbrella"]` | Enabled feeds, tried in order |
+| `seed_file` | `null` | Optional local candidate list |
+| `certstream_url` | `wss://certstream.calidog.io/domains-only` | Certstream websocket |
+| `certstream_buffer` | `20000` | Streamed domains held between cycles |
+| `certstream_wait` | `15` | Seconds a fetch waits for the stream to produce names |
+| `recheck_after` | `0` | Re-probe domains older than this many seconds (`0` = off) |
+| `recheck_batch` | `100` | Stale domains re-queued per cycle |
+| `recheck_only` | `false` | Skip discovery, re-check stored domains only |
+| `verify_ssl` | `false` | Verify TLS certificates |
+| `write_tech_files` | `true` | Write `output/<technology>.txt` |
+| `store_unresponsive` | `true` | Keep unreachable domains in the database |
+| `use_builtwith` | `false` | Also run the optional `builtwith` package |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+Every value is range-checked on load — a bad config is reported clearly instead of
+crashing the collector mid-run.
 
 ---
 
-📁 Output Structure
+## 📁 Output
 
 ```
-domain-collector/
-├── domains.db              # SQLite database (all discovered domains)
-├── output/                 # Technology‑specific text files
-│   ├── React.txt           # Domains using React
-│   ├── Nginx.txt           # Domains using Nginx
-│   ├── WordPress.txt       # Domains using WordPress
-│   └── ...                 # One file per detected technology
-└── domain_collector.py     # Main script
+All-Domain/
+├── domains.db          # every domain, with status, versions, timings and source
+├── output/             # one file per detected technology
+│   ├── Nginx.txt
+│   ├── WordPress.txt
+│   └── React.txt
+├── .cache/             # cached ranking lists + per-source read positions
+└── config.json         # your settings
 ```
 
-Each technology file contains one domain per line, appended in real‑time as they are discovered.
+The database keeps more than the text files do:
+
+```sql
+-- domains:     fingerprint, raw, first_seen, responsive, technologies (JSON),
+--              status_code, scheme, error, elapsed_ms, source, checked_at
+-- domain_tech: fingerprint, technology, version
+SELECT technology, COUNT(*) FROM domain_tech GROUP BY technology ORDER BY 2 DESC;
+```
+
+Databases written by version 1.x are migrated automatically on first open.
 
 ---
 
-🛡️ Ethical Considerations
+## 📡 Live Certificate Transparency (certstream)
 
-· Respect sources: Only use public, permissive data sources (e.g., Certificate Transparency logs).
-· Rate limiting: The tool uses a semaphore to limit concurrent requests; you are responsible for adjusting it to avoid overwhelming target servers.
-· Robots.txt: Always obey robots.txt when scraping. This tool does not scrape websites for content – it only checks availability and extracts server headers.
-· Legal use: Use this tool only for legitimate purposes, such as security research, technology adoption analysis, or building public datasets. Do not use it to attack, probe without permission, or violate any applicable laws.
+The `certstream` source holds a **persistent websocket** to a
+[certstream-server](https://github.com/d-Rickyy-b/certstream-server-go) and buffers every
+name it sees; each cycle drains the buffer. It understands both message shapes — the full
+`certificate_update` payload and the lighter `domains-only` feed — ignores heartbeats,
+strips wildcards, and reconnects with exponential backoff if the server hangs up.
 
----
-
-🧠 How it works (high-level)
-
-1. Producer fetches domains from sources (e.g., crt.sh) and enqueues them.
-2. Consumers (workers) take a domain from the queue:
-   · Generate a fingerprint (punycode + lowercase + stripped).
-   · Check if it already exists in the database – if so, skip.
-   · Attempt HTTP and HTTPS connections.
-   · If responsive, fetch the HTML (limited size) and run builtwith to detect technologies.
-   · Insert the domain, responsiveness flag, and technology list into SQLite.
-   · Append the domain to each detected technology’s .txt file.
-3. This loop runs forever, with the producer sleeping for FETCH_INTERVAL between cycles.
+> ⚠️ **The public `certstream.calidog.io` server accepts connections but is frequently
+> idle** — it will connect and then send nothing. When that happens the source reports
+> `no certificates received`, goes on cooldown, and the other configured sources carry the
+> cycle. For a dependable live feed, run your own certstream-server-go and point
+> `--certstream-url` at it.
 
 ---
 
-🤝 Contributing
+## 🔁 Re-check scheduling
 
-Contributions are welcome! Please:
+Domains are probed once when discovered. Set `recheck_after` and the producer also
+re-queues rows whose `checked_at` is older than that, oldest first, `recheck_batch` per
+cycle:
 
-· Fork the repository.
-· Create a feature branch.
-· Make your changes (add new sources, improve tech detection, etc.).
-· Submit a pull request with a clear description.
+```bash
+python domain_collector.py --headless --recheck-after 86400   # daily refresh
+python domain_collector.py --headless --recheck-after 604800 --recheck-only
+```
 
-For major changes, open an issue first to discuss what you would like to change.
-
----
-
-📄 License
-
-Distributed under the MIT License. See LICENSE for more information.
-
----
-
-🙏 Acknowledgements
-
-· crt.sh for providing Certificate Transparency data.
-· builtwith for technology fingerprinting.
-· pyfiglet for the banner.
+A re-check **updates the existing row in place** — status, technologies, timing and
+`checked_at` — rather than inserting a duplicate. Technologies that disappeared are
+removed rather than merged, and a domain is never appended twice to the same
+`output/<technology>.txt`. Rows written by the 1.x collector have no `checked_at`, so they
+fall back to `first_seen` and are refreshed first.
 
 ---
 
-Happy Recon! – IamG2
+## 🧠 How it works
+
+1. **Producer** re-queues any domains due for a re-check, then asks each configured
+   source for new candidates. A source that fails
+   (crt.sh regularly returns HTTP 502) is put on an escalating cooldown while the
+   others carry on — one dead feed never stops the run.
+2. Candidates are **normalised** (`https://Example.COM:8443/x` → `example.com`,
+   `*.a.b.com` → `a.b.com`, IDN → punycode) and rejected if they are not real domains.
+3. Each new fingerprint is **reserved** in memory and pushed onto a bounded queue.
+4. **Consumers** probe HTTPS, then HTTP, reading at most `max_body_bytes` of the body,
+   and fingerprint the response headers, cookies, meta tags and HTML.
+5. Results are **batched** into SQLite (WAL mode, `executemany`) and appended to the
+   technology files.
+6. The producer sleeps for `fetch_interval` and goes again — interruptibly.
+
+The ranking lists are cached on disk for 24 hours and read a window at a time, so each
+cycle brings *new* domains rather than re-probing the same first N entries.
+
+---
+
+## 🖥️ The GUI
+
+- Start / Pause / Resume / Stop, with buttons that enable and disable to match the state
+- Live counters: processed, responsive, unreachable, new, re-checked, queue depth, probes/s
+- Live technology table and a colour-coded activity log (capped so it cannot eat memory)
+- **Settings** dialog (concurrency, timeouts, sources, certstream URL, re-check schedule)
+  that validates input and persists to `config.json`
+- **Export** button for the activity log
+- Closing the window stops collection cleanly instead of killing it mid-write
+
+The engine runs on its own event loop in a worker thread and communicates with Tk through
+a queue — no widget is ever touched from a background thread.
+
+---
+
+## 🧪 Tests
+
+```bash
+pip install pytest pytest-asyncio
+python -m pytest
+```
+
+140 tests cover domain normalisation, technology detection, the store (including 1.x
+database migration and re-check updates), source parsing and caching, certstream against a
+local websocket server, the threaded runner, the CLI, and full producer/consumer cycles
+against a real local HTTP server.
+
+---
+
+## 🛡️ Ethical considerations
+
+- **Public sources only.** Certificate Transparency logs and published ranking lists.
+- **Be polite.** `concurrency` is yours to tune; `limit_per_host` is capped at 4 and each
+  domain is requested at most twice (HTTPS, then HTTP). No content scraping, no crawling
+  beyond the landing page, no brute forcing.
+- **Legal use.** Security research, technology-adoption analysis, and public dataset
+  building. Do not use it to attack or probe systems you are not authorised to test.
+
+---
+
+## 🤝 Contributing
+
+Adding a source is a subclass of `Source` in `domaincollector/sources.py` plus an entry in
+`SOURCE_CLASSES`. Adding a fingerprint is one `Rule` in `domaincollector/tech.py`. Please
+run `python -m pytest` before opening a pull request.
+
+---
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+Happy Recon! – IamG2ont

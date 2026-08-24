@@ -1,0 +1,18 @@
+# Collector output
+domains.db
+domains.db-wal
+domains.db-shm
+output/
+.cache/
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
