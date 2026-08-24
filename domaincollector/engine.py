@@ -50,6 +50,7 @@ class Stats:
     responsive: int = 0
     new: int = 0
     duplicates: int = 0
+    rechecked: int = 0
     unreachable: int = 0
     errors: int = 0
     cycles: int = 0
@@ -75,6 +76,7 @@ class Stats:
             "responsive": self.responsive,
             "new": self.new,
             "duplicates": self.duplicates,
+            "rechecked": self.rechecked,
             "unreachable": self.unreachable,
             "errors": self.errors,
             "cycles": self.cycles,
@@ -229,6 +231,9 @@ class Collector:
         self._pause_requested = False
         self._tasks: List[asyncio.Task] = []
         self._cooldowns: Dict[str, float] = {}
+        #: Domains queued for a re-check; they are already in the store, so
+        #: store.reserve() cannot be used to keep them out of the queue twice.
+        self._rechecking: set = set()
         self._running = False
 
     # ------------------------------------------------------------------ state
@@ -311,10 +316,18 @@ class Collector:
             await self.store.open()
         self._queue = asyncio.Queue(maxsize=self.config.max_queue_size)
         self._emit(Event("state", "Started.", "INFO", {"state": "running"}))
-        self._log(
-            f"Collector started - {self.config.concurrency} workers, "
-            f"sources: {', '.join(source.name for source in self.sources)}"
-        )
+        if self.config.recheck_only:
+            self._log(
+                f"Collector started - {self.config.concurrency} workers, "
+                f"re-check only (domains older than {self.config.recheck_after}s)"
+            )
+        else:
+            self._log(
+                f"Collector started - {self.config.concurrency} workers, "
+                f"sources: {', '.join(source.name for source in self.sources)}"
+                + (f", re-checking after {self.config.recheck_after}s"
+                   if self.config.recheck_after else "")
+            )
 
         producer = asyncio.create_task(self._producer(session, cycles), name="producer")
         consumers = [
@@ -336,6 +349,11 @@ class Collector:
                 task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
             self._tasks = []
+            for source in self.sources:
+                try:
+                    await source.close()
+                except Exception:
+                    pass
             try:
                 if self._owns_store:
                     await self.store.close()
@@ -383,13 +401,16 @@ class Collector:
     async def _fetch_cycle(self, session: "aiohttp.ClientSession") -> int:
         assert self._queue is not None
         wanted = self.config.max_domains_per_cycle
-        queued = 0
+        queued = await self._queue_rechecks()
+        if self.config.recheck_only:
+            self.stats.queued = self._queue.qsize()
+            return queued
         now = time.monotonic()
         usable = [s for s in self.sources if self._cooldowns.get(s.name, 0.0) <= now]
         if not usable:
             soonest = min(self._cooldowns.values()) - now
             self._log(f"All sources cooling down, retrying in {max(1, int(soonest))}s", "WARN")
-            return 0
+            return queued
 
         for source in usable:
             if self._stop.is_set() or queued >= wanted:
@@ -433,12 +454,37 @@ class Collector:
         self.stats.queued = self._queue.qsize()
         return queued
 
-    async def _enqueue(self, fingerprint: str, source_name: str) -> bool:
+    async def _queue_rechecks(self) -> int:
+        """Re-queue domains whose last check is older than ``recheck_after``."""
+        if self.config.recheck_after <= 0:
+            return 0
+        try:
+            stale = await self.store.stale_domains(self.config.recheck_after, self.config.recheck_batch)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"Could not look up stale domains: {type(exc).__name__}: {exc}", "ERROR")
+            return 0
+        queued = 0
+        for fingerprint in stale:
+            if self._stop is not None and self._stop.is_set():
+                break
+            if fingerprint in self._rechecking:
+                continue
+            self._rechecking.add(fingerprint)
+            if not await self._enqueue(fingerprint, "recheck", recheck=True):
+                self._rechecking.discard(fingerprint)
+                break
+            queued += 1
+        if queued:
+            age = self.config.recheck_after
+            self._log(f"recheck: {queued} domains re-queued (older than {age}s)", "INFO")
+        return queued
+
+    async def _enqueue(self, fingerprint: str, source_name: str, recheck: bool = False) -> bool:
         """Put a domain on the queue, giving up if the queue stays full."""
         assert self._queue is not None
         while not self._stop.is_set():
             try:
-                self._queue.put_nowait((fingerprint, source_name))
+                self._queue.put_nowait((fingerprint, source_name, recheck))
                 return True
             except asyncio.QueueFull:
                 try:
@@ -464,14 +510,16 @@ class Collector:
             if self._stop.is_set():
                 break
             try:
-                fingerprint, source_name = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                fingerprint, source_name, is_recheck = await asyncio.wait_for(
+                    self._queue.get(), timeout=0.5
+                )
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
             try:
                 result = await probe_domain(session, fingerprint, self.config, ssl_arg)
-                if not result.responsive and not self.config.store_unresponsive:
+                if not result.responsive and not self.config.store_unresponsive and not is_recheck:
                     self.store.release(fingerprint)
                 else:
                     record = DomainRecord(
@@ -485,9 +533,13 @@ class Collector:
                         error=result.error,
                         elapsed_ms=result.elapsed_ms,
                         source=source_name,
+                        recheck=is_recheck,
                     )
                     if await self.store.add(record):
-                        self.stats.new += 1
+                        if is_recheck:
+                            self.stats.rechecked += 1
+                        else:
+                            self.stats.new += 1
                     else:
                         self.stats.duplicates += 1
                 self.stats.processed += 1
@@ -498,7 +550,7 @@ class Collector:
                 for technology in result.technologies:
                     self.stats.tech_counts[technology] += 1
                 verdict = "OK" if result.responsive else "DOWN"
-                details = []
+                details = ["re-check"] if is_recheck else []
                 if result.status_code is not None:
                     details.append(f"HTTP {result.status_code}")
                 elif result.error:
@@ -532,5 +584,6 @@ class Collector:
                 self.store.release(fingerprint)
                 self._log(f"Error processing {fingerprint}: {type(exc).__name__}: {exc}", "ERROR")
             finally:
+                self._rechecking.discard(fingerprint)
                 self._queue.task_done()
                 self.stats.queued = self._queue.qsize()

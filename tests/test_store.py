@@ -140,3 +140,90 @@ async def test_write_tech_files_can_be_disabled(tmp_path):
     finally:
         await store.close()
     assert not (tmp_path / "out").exists()
+
+
+async def test_stale_domains_respects_the_cutoff(store):
+    await store.add(DomainRecord("fresh.com", "fresh.com", True, ["Nginx"]))
+    await store.flush()
+    assert await store.stale_domains(3600, 10) == []
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("UPDATE domains SET checked_at = '2000-01-01 00:00:00'")
+        conn.commit()
+    assert await store.stale_domains(3600, 10) == ["fresh.com"]
+    assert await store.stale_domains(0, 10) == []       # disabled
+    assert await store.stale_domains(3600, 0) == []     # no budget
+
+
+async def test_stale_domains_are_ordered_oldest_first(store):
+    for name in ("a.com", "b.com"):
+        await store.add(DomainRecord(name, name, True, []))
+    await store.flush()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("UPDATE domains SET checked_at = '2001-01-01 00:00:00' WHERE fingerprint = 'a.com'")
+        conn.execute("UPDATE domains SET checked_at = '2000-01-01 00:00:00' WHERE fingerprint = 'b.com'")
+        conn.commit()
+    assert await store.stale_domains(3600, 10) == ["b.com", "a.com"]
+
+
+async def test_recheck_updates_the_row_instead_of_inserting(store):
+    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"],
+                                 versions={"Nginx": "1.0"}, status_code=200))
+    await store.flush()
+    assert await store.add(DomainRecord("a.com", "a.com", False, [], status_code=503,
+                                        error="HTTP 503", recheck=True))
+    await store.flush()
+
+    assert (await store.summary())["total"] == 1
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute("SELECT responsive, status_code, error FROM domains").fetchone()
+        techs = conn.execute("SELECT COUNT(*) FROM domain_tech").fetchone()[0]
+    assert row == (0, 503, "HTTP 503")
+    assert techs == 0  # technologies that vanished are removed, not merged
+
+
+async def test_recheck_replaces_the_technology_set(store):
+    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
+    await store.flush()
+    await store.add(DomainRecord("a.com", "a.com", True, ["Apache", "React"], recheck=True))
+    await store.flush()
+    assert await store.top_technologies() == [("Apache", 1), ("React", 1)]
+
+
+async def test_recheck_does_not_duplicate_technology_file_lines(tmp_path, store):
+    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
+    await store.flush()
+    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx", "React"], recheck=True))
+    await store.flush()
+    assert (tmp_path / "out" / "Nginx.txt").read_text() == "a.com\n"
+    assert (tmp_path / "out" / "React.txt").read_text() == "a.com\n"
+
+
+async def test_checked_at_is_utc(store):
+    """stale_domains() compares against a UTC cutoff, so writes must be UTC."""
+    import datetime
+
+    await store.add(DomainRecord("a.com", "a.com", True, []))
+    stamp = await store.last_checked("a.com")
+    written = datetime.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.utcnow()
+    assert abs((now - written).total_seconds()) < 60
+
+
+async def test_legacy_rows_without_checked_at_are_stale(tmp_path):
+    db = str(tmp_path / "legacy.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE domains (fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL, "
+            "first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, responsive BOOLEAN DEFAULT 0, "
+            "technologies TEXT)"
+        )
+        conn.execute("INSERT INTO domains (fingerprint, raw, responsive, first_seen) VALUES (?,?,?,?)",
+                     ("old.com", "old.com", 1, "2010-01-01 00:00:00"))
+        conn.commit()
+    store = DomainStore(db, str(tmp_path / "out"))
+    await store.open()
+    try:
+        assert await store.stale_domains(3600, 10) == ["old.com"]
+    finally:
+        await store.close()

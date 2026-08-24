@@ -58,6 +58,8 @@ class DomainRecord:
     error: Optional[str] = None
     elapsed_ms: Optional[int] = None
     source: Optional[str] = None
+    #: True when this record replaces an existing row (a scheduled re-check).
+    recheck: bool = False
 
 
 class DomainStore:
@@ -204,7 +206,17 @@ class DomainStore:
 
     # ---------------------------------------------------------------- writing
     async def add(self, record: DomainRecord) -> bool:
-        """Buffer *record* for insertion.  ``False`` when it is a duplicate."""
+        """Buffer *record* for writing.  ``False`` when it is a duplicate.
+
+        A record flagged ``recheck`` updates the existing row instead of being
+        rejected as a duplicate.
+        """
+        if record.recheck:
+            self._reserved.discard(record.fingerprint)
+            self._pending.append(record)
+            if len(self._pending) >= self.flush_size:
+                await self.flush()
+            return True
         if record.fingerprint in self._seen:
             self._reserved.discard(record.fingerprint)
             return False
@@ -234,9 +246,12 @@ class DomainStore:
             batch, self._pending = self._pending, []
             if self._db is None:
                 return 0
-            now = time.strftime("%Y-%m-%d %H:%M:%S")
-            rows = [
-                (
+            # UTC, to match SQLite's CURRENT_TIMESTAMP default on first_seen
+            # and the cutoff used by stale_domains().
+            now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+            def values(record: DomainRecord):
+                return (
                     record.fingerprint,
                     record.raw,
                     1 if record.responsive else 0,
@@ -248,23 +263,48 @@ class DomainStore:
                     record.source,
                     now,
                 )
-                for record in batch
-            ]
+
+            rows = [values(record) for record in batch if not record.recheck]
+            updates = [values(record)[2:] + (record.fingerprint,) for record in batch if record.recheck]
+            rechecked = [record.fingerprint for record in batch if record.recheck]
             tech_rows = [
                 (record.fingerprint, technology, record.versions.get(technology) or None)
                 for record in batch
                 for technology in record.technologies
             ]
+            previous_pairs: Set[Tuple[str, str]] = set()
+            if rechecked and self.write_tech_files:
+                placeholders = ",".join("?" * len(rechecked))
+                async with self._db.execute(
+                    f"SELECT fingerprint, technology FROM domain_tech WHERE fingerprint IN ({placeholders})",
+                    rechecked,
+                ) as cursor:
+                    previous_pairs = {(row[0], row[1]) async for row in cursor}
             try:
-                await self._db.executemany(
-                    """
-                    INSERT OR IGNORE INTO domains
-                        (fingerprint, raw, responsive, technologies, status_code,
-                         scheme, error, elapsed_ms, source, checked_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
+                if rows:
+                    await self._db.executemany(
+                        """
+                        INSERT OR IGNORE INTO domains
+                            (fingerprint, raw, responsive, technologies, status_code,
+                             scheme, error, elapsed_ms, source, checked_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                if updates:
+                    await self._db.executemany(
+                        """
+                        UPDATE domains SET responsive = ?, technologies = ?, status_code = ?,
+                               scheme = ?, error = ?, elapsed_ms = ?, source = ?, checked_at = ?
+                        WHERE fingerprint = ?
+                        """,
+                        updates,
+                    )
+                    # Technologies can disappear between checks - replace, do not merge.
+                    await self._db.executemany(
+                        "DELETE FROM domain_tech WHERE fingerprint = ?",
+                        [(fingerprint,) for fingerprint in rechecked],
+                    )
                 if tech_rows:
                     await self._db.executemany(
                         "INSERT OR IGNORE INTO domain_tech (fingerprint, technology, version) "
@@ -277,15 +317,20 @@ class DomainStore:
                 self._pending = batch + self._pending
                 raise
             if self.write_tech_files:
-                await self._write_tech_files(batch)
+                await self._write_tech_files(batch, previous_pairs)
             return len(batch)
 
-    async def _write_tech_files(self, batch: Sequence[DomainRecord]) -> None:
+    async def _write_tech_files(
+        self, batch: Sequence[DomainRecord], already_written: Optional[Set[Tuple[str, str]]] = None
+    ) -> None:
+        already_written = already_written or set()
         grouped: Dict[str, List[str]] = {}
         for record in batch:
             if not record.responsive:
                 continue
             for technology in record.technologies:
+                if (record.fingerprint, technology) in already_written:
+                    continue  # a re-check that found the same technology again
                 grouped.setdefault(safe_filename(technology), []).append(record.raw)
         if not grouped:
             return
@@ -300,6 +345,38 @@ class DomainStore:
                 handle.write("\n".join(domains) + "\n")
 
     # ---------------------------------------------------------------- queries
+    async def stale_domains(self, older_than_seconds: int, limit: int = 100) -> List[str]:
+        """Fingerprints last checked more than *older_than_seconds* ago.
+
+        Rows written by the 1.x collector have no ``checked_at`` at all; they
+        fall back to ``first_seen``, and are re-checked first.
+        """
+        if older_than_seconds <= 0 or limit <= 0:
+            return []
+        await self.flush()
+        assert self._db is not None
+        cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - older_than_seconds))
+        async with self._db.execute(
+            """
+            SELECT fingerprint FROM domains
+            WHERE COALESCE(checked_at, first_seen, '') < ?
+            ORDER BY COALESCE(checked_at, first_seen, '') ASC
+            LIMIT ?
+            """,
+            (cutoff, int(limit)),
+        ) as cursor:
+            return [row[0] async for row in cursor]
+
+    async def last_checked(self, fingerprint: str) -> Optional[str]:
+        """``checked_at`` for one domain (used by tests and the CLI)."""
+        await self.flush()
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT checked_at FROM domains WHERE fingerprint = ?", (fingerprint,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
     async def summary(self) -> Dict[str, int]:
         """Totals straight from the database."""
         await self.flush()

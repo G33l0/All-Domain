@@ -55,3 +55,34 @@ def test_version(capsys):
         main(["--version"])
     assert excinfo.value.code == 0
     assert "domain-collector" in capsys.readouterr().out
+
+
+def test_recheck_and_certstream_overrides():
+    args = build_parser().parse_args(
+        ["--recheck-after", "86400", "--recheck-batch", "50",
+         "--certstream-url", "ws://localhost:8080/domains-only", "--sources", "certstream"]
+    )
+    config = apply_overrides(Config(), args)
+    assert config.recheck_after == 86400
+    assert config.recheck_batch == 50
+    assert config.certstream_url == "ws://localhost:8080/domains-only"
+    assert config.sources == ["certstream"]
+
+
+def test_bad_certstream_url_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        main(["--certstream-url", "https://not-a-websocket"])
+    assert "certstream_url" in capsys.readouterr().err
+
+
+def test_recheck_only_requires_a_recheck_interval(capsys):
+    with pytest.raises(SystemExit):
+        main(["--recheck-only"])
+    assert "recheck_after" in capsys.readouterr().err
+
+
+def test_recheck_only_is_accepted_with_an_interval():
+    args = build_parser().parse_args(["--recheck-only", "--recheck-after", "3600"])
+    config = apply_overrides(Config(), args)
+    assert config.recheck_only is True
+    assert config.recheck_after == 3600

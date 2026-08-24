@@ -51,6 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"comma separated feed list ({', '.join(SOURCE_NAMES)})")
     parser.add_argument("--seed-file", default=None, dest="seed_file",
                         help="file with candidate domains, one per line")
+    parser.add_argument("--certstream-url", default=None, dest="certstream_url",
+                        help="certstream websocket URL (use your own certstream-server "
+                             "instance; the public one is often idle)")
+    parser.add_argument("--recheck-after", type=int, default=None, dest="recheck_after",
+                        metavar="SECONDS",
+                        help="re-probe stored domains older than this (0 disables re-checking)")
+    parser.add_argument("--recheck-batch", type=int, default=None, dest="recheck_batch",
+                        metavar="N", help="how many stale domains to re-queue per cycle")
+    parser.add_argument("--recheck-only", action="store_true",
+                        help="only re-check stored domains, do not discover new ones "
+                             "(requires --recheck-after)")
     parser.add_argument("--no-tech-files", action="store_true", help="do not write output/<tech>.txt")
     parser.add_argument("--responsive-only", action="store_true",
                         help="store only domains that answered")
@@ -68,7 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
     for field_name in ("concurrency", "http_timeout", "fetch_interval", "max_domains_per_cycle",
-                       "db_path", "output_dir", "seed_file", "log_level"):
+                       "db_path", "output_dir", "seed_file", "log_level",
+                       "certstream_url", "recheck_after", "recheck_batch"):
         value = getattr(args, field_name, None)
         if value is not None:
             setattr(config, field_name, value)
@@ -82,6 +94,8 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
         config.verify_ssl = True
     if args.use_builtwith:
         config.use_builtwith = True
+    if args.recheck_only:
+        config.recheck_only = True
     return config.validate()
 
 
@@ -123,10 +137,10 @@ async def run_headless(config: Config, cycles: Optional[int]) -> int:
 
     stats = await collector.run(cycles=cycles)
     logger.info(
-        "Finished: %d probed, %d responsive, %d unreachable, %d new, %d errors "
-        "in %d cycle(s) (%.1f/s)",
+        "Finished: %d probed, %d responsive, %d unreachable, %d new, %d re-checked, "
+        "%d errors in %d cycle(s) (%.1f/s)",
         stats.processed, stats.responsive, stats.unreachable, stats.new,
-        stats.errors, stats.cycles, stats.rate,
+        stats.rechecked, stats.errors, stats.cycles, stats.rate,
     )
     if stats.tech_counts:
         logger.info("Top technologies: %s", ", ".join(

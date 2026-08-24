@@ -19,6 +19,10 @@ DEFAULT_USER_AGENT = (
     "Chrome/124.0 Safari/537.36 domain-collector/2.0"
 )
 
+#: Public certstream server.  It is frequently idle - point this at your own
+#: certstream-server-go instance for a reliable feed.
+DEFAULT_CERTSTREAM_URL = "wss://certstream.calidog.io/domains-only"
+
 #: Sources enabled when the user does not choose explicitly.
 DEFAULT_SOURCES: List[str] = ["crtsh", "tranco", "umbrella"]
 
@@ -78,6 +82,19 @@ class Config:
     max_domains_per_cycle: int = 500
     max_body_bytes: int = 262144
     source_retries: int = 3
+    #: Re-probe a stored domain once it is older than this many seconds
+    #: (0 disables re-checking entirely).  86400 = once a day.
+    recheck_after: int = 0
+    #: How many stale domains to re-queue per cycle.
+    recheck_batch: int = 100
+    #: Only re-check stored domains; do not pull new candidates from sources.
+    recheck_only: bool = False
+    #: Live Certificate Transparency stream (certstream-server protocol).
+    certstream_url: str = DEFAULT_CERTSTREAM_URL
+    #: How many streamed domains to hold between cycles.
+    certstream_buffer: int = 20000
+    #: Seconds a certstream fetch waits for the stream to produce something.
+    certstream_wait: float = 15.0
     db_path: str = "domains.db"
     output_dir: str = "output"
     cache_dir: str = ".cache"
@@ -103,10 +120,25 @@ class Config:
         )
         self.max_body_bytes = _as_int("max_body_bytes", self.max_body_bytes, 1024, 20_971_520, defaults.max_body_bytes)
         self.source_retries = _as_int("source_retries", self.source_retries, 1, 10, defaults.source_retries)
+        self.recheck_after = _as_int("recheck_after", self.recheck_after, 0, 31_536_000, defaults.recheck_after)
+        self.recheck_batch = _as_int("recheck_batch", self.recheck_batch, 1, 100_000, defaults.recheck_batch)
+        self.certstream_buffer = _as_int(
+            "certstream_buffer", self.certstream_buffer, 100, 1_000_000, defaults.certstream_buffer
+        )
+        self.certstream_wait = _as_float(
+            "certstream_wait", self.certstream_wait, 1.0, 300.0, defaults.certstream_wait
+        )
+        certstream_url = str(self.certstream_url or "").strip() or defaults.certstream_url
+        if not certstream_url.startswith(("ws://", "wss://")):
+            raise ConfigError(f"certstream_url must start with ws:// or wss://, got {certstream_url!r}")
+        self.certstream_url = certstream_url
         self.verify_ssl = _as_bool("verify_ssl", self.verify_ssl, defaults.verify_ssl)
         self.write_tech_files = _as_bool("write_tech_files", self.write_tech_files, defaults.write_tech_files)
         self.store_unresponsive = _as_bool("store_unresponsive", self.store_unresponsive, defaults.store_unresponsive)
         self.use_builtwith = _as_bool("use_builtwith", self.use_builtwith, defaults.use_builtwith)
+        self.recheck_only = _as_bool("recheck_only", self.recheck_only, defaults.recheck_only)
+        if self.recheck_only and self.recheck_after <= 0:
+            raise ConfigError("recheck_only needs recheck_after to be greater than 0")
 
         if not str(self.db_path).strip():
             raise ConfigError("db_path must not be empty")

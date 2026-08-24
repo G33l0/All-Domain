@@ -89,7 +89,7 @@ class DomainCollectorApp:
         frame = tk.Frame(self.root)
         frame.pack(fill=tk.X, padx=10, pady=4)
         self.stat_labels: Dict[str, tk.Label] = {}
-        for key in ("Processed", "Responsive", "Unreachable", "New", "Queue", "Rate"):
+        for key in ("Processed", "Responsive", "Unreachable", "New", "Re-checked", "Queue", "Rate"):
             label = tk.Label(frame, text=f"{key}: 0", font=("Arial", 10))
             label.pack(side=tk.LEFT, padx=8)
             self.stat_labels[key] = label
@@ -202,6 +202,8 @@ class DomainCollectorApp:
             ("fetch_interval", "Fetch interval (seconds)"),
             ("max_queue_size", "Max queue size"),
             ("max_domains_per_cycle", "Domains per cycle"),
+            ("recheck_after", "Re-check after (seconds, 0 = off)"),
+            ("recheck_batch", "Re-checks per cycle"),
         ]
         row = 0
         for field_name, label in numeric_fields:
@@ -211,6 +213,12 @@ class DomainCollectorApp:
             entry.grid(row=row, column=1, padx=10, pady=4)
             entries[field_name] = entry
             row += 1
+
+        tk.Label(dialog, text="Certstream URL", anchor="w").grid(row=row, column=0, sticky="w", padx=10, pady=4)
+        certstream_entry = tk.Entry(dialog, width=18)
+        certstream_entry.insert(0, str(self.config.certstream_url))
+        certstream_entry.grid(row=row, column=1, padx=10, pady=4)
+        row += 1
 
         tk.Label(dialog, text="Sources", anchor="w").grid(row=row, column=0, sticky="nw", padx=10, pady=4)
         source_frame = tk.Frame(dialog)
@@ -232,6 +240,10 @@ class DomainCollectorApp:
         tk.Checkbutton(dialog, text="Write output/<technology>.txt files", variable=files_var).grid(
             row=row, column=0, columnspan=2, sticky="w", padx=10)
         row += 1
+        recheck_only_var = tk.BooleanVar(value=self.config.recheck_only)
+        tk.Checkbutton(dialog, text="Re-check stored domains only (no new discovery)",
+                       variable=recheck_only_var).grid(row=row, column=0, columnspan=2, sticky="w", padx=10)
+        row += 1
         unresponsive_var = tk.BooleanVar(value=self.config.store_unresponsive)
         tk.Checkbutton(dialog, text="Store unresponsive domains in the database", variable=unresponsive_var).grid(
             row=row, column=0, columnspan=2, sticky="w", padx=10)
@@ -239,7 +251,8 @@ class DomainCollectorApp:
 
         note = tk.Label(
             dialog,
-            text="Timeout and interval apply immediately.\nConcurrency and sources apply on the next Start.",
+            text="Timeout, interval and re-check settings apply immediately.\n"
+                 "Concurrency and sources apply on the next Start.",
             font=("Arial", 8), fg="gray", justify="left",
         )
         note.grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 0))
@@ -252,9 +265,11 @@ class DomainCollectorApp:
                     raw = entry.get().strip()
                     value = float(raw) if field_name == "http_timeout" else int(raw)
                     setattr(candidate, field_name, value)
+                candidate.certstream_url = certstream_entry.get().strip()
                 candidate.verify_ssl = verify_var.get()
                 candidate.write_tech_files = files_var.get()
                 candidate.store_unresponsive = unresponsive_var.get()
+                candidate.recheck_only = recheck_only_var.get()
                 chosen = [name for name, var in source_vars.items() if var.get()]
                 # Sources with no checkbox (e.g. a seed "file" source) are kept.
                 preserved = [name for name in self.config.sources if name not in source_vars]
@@ -338,6 +353,7 @@ class DomainCollectorApp:
         self.stat_labels["Responsive"].config(text=f"Responsive: {stats.responsive}")
         self.stat_labels["New"].config(text=f"New: {stats.new}")
         self.stat_labels["Unreachable"].config(text=f"Unreachable: {stats.unreachable}")
+        self.stat_labels["Re-checked"].config(text=f"Re-checked: {stats.rechecked}")
         self.stat_labels["Queue"].config(text=f"Queue: {stats.queued}")
         self.stat_labels["Rate"].config(text=f"Rate: {stats.rate:.1f}/s")
 

@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/status-active-brightgreen" alt="Status">
-  <img src="https://img.shields.io/badge/tests-111%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-140%20passing-brightgreen" alt="Tests">
 </p>
 
 > *Autonomous, asynchronous domain intelligence & technology fingerprinting framework*
@@ -21,8 +21,9 @@ It runs either as a **desktop GUI** or **fully headless in a terminal**.
 
 ## 🎯 What it does
 
-- 🔍 **Discovers** domains from several public feeds (Certificate Transparency via crt.sh,
-  the Tranco / Cisco Umbrella / Majestic ranking lists, or your own seed file)
+- 🔍 **Discovers** domains from several public feeds — Certificate Transparency in real
+  time over a **certstream websocket**, crt.sh searches, the Tranco / Cisco Umbrella /
+  Majestic ranking lists, or your own seed file
 - ✅ **Validates** every candidate (punycode, label rules, TLD sanity, no IPs or wildcards)
   before a single request is made
 - 🌐 **Probes** each domain over HTTPS, falling back to HTTP
@@ -30,6 +31,7 @@ It runs either as a **desktop GUI** or **fully headless in a terminal**.
   analytics, security headers — from response headers, cookies, `<meta>` tags and HTML,
   including version numbers where they are exposed
 - 📁 **Writes** `output/<technology>.txt` in real time, one domain per line
+- 🔁 **Re-checks** stored domains on a schedule, so the dataset tracks stacks that change
 - 🛡️ **Deduplicates** in memory *and* in SQLite, so a domain is never probed or stored twice
 - ⚡ **Scales** with configurable concurrency and a bounded work queue
 
@@ -71,6 +73,16 @@ python domain_collector.py --headless --once --limit 100 --concurrency 50
 # Feed it your own list instead of the public sources
 python domain_collector.py --headless --sources file --seed-file my-domains.txt
 
+# Live Certificate Transparency stream (see the certstream note below)
+python domain_collector.py --headless --sources certstream \
+    --certstream-url ws://127.0.0.1:8080/domains-only
+
+# Discover new domains and re-check anything last seen over a day ago
+python domain_collector.py --headless --recheck-after 86400 --recheck-batch 200
+
+# Re-check only: refresh what is already stored, discover nothing new
+python domain_collector.py --headless --recheck-after 86400 --recheck-only
+
 # Inspect what has been collected so far
 python domain_collector.py --stats
 python domain_collector.py --export WordPress > wordpress-sites.txt
@@ -89,8 +101,12 @@ database and HTTP sessions are closed. Press it twice to force an immediate exit
 | `--timeout SECONDS` | Per-request timeout (default 10) |
 | `--interval SECONDS` | Delay between fetch cycles (default 1800) |
 | `--limit N` | Max domains queued per cycle (default 500) |
-| `--sources LIST` | `crtsh`, `tranco`, `umbrella`, `majestic`, `file` (comma separated) |
+| `--sources LIST` | `crtsh`, `certstream`, `tranco`, `umbrella`, `majestic`, `file` (comma separated) |
 | `--seed-file PATH` | Local file of candidate domains, one per line |
+| `--certstream-url URL` | Certstream websocket to stream CT logs from |
+| `--recheck-after SECONDS` | Re-probe stored domains older than this (`0` disables) |
+| `--recheck-batch N` | How many stale domains to re-queue per cycle |
+| `--recheck-only` | Refresh stored domains only, discover nothing new |
 | `--db PATH` / `--output DIR` | Database and technology-file locations |
 | `--responsive-only` | Store only domains that answered |
 | `--no-tech-files` | Database only, skip `output/*.txt` |
@@ -120,6 +136,12 @@ dialog). Command line flags override the file for a single run.
 | `cache_dir` | `.cache` | Cached ranking lists and feed positions |
 | `sources` | `["crtsh","tranco","umbrella"]` | Enabled feeds, tried in order |
 | `seed_file` | `null` | Optional local candidate list |
+| `certstream_url` | `wss://certstream.calidog.io/domains-only` | Certstream websocket |
+| `certstream_buffer` | `20000` | Streamed domains held between cycles |
+| `certstream_wait` | `15` | Seconds a fetch waits for the stream to produce names |
+| `recheck_after` | `0` | Re-probe domains older than this many seconds (`0` = off) |
+| `recheck_batch` | `100` | Stale domains re-queued per cycle |
+| `recheck_only` | `false` | Skip discovery, re-check stored domains only |
 | `verify_ssl` | `false` | Verify TLS certificates |
 | `write_tech_files` | `true` | Write `output/<technology>.txt` |
 | `store_unresponsive` | `true` | Keep unreachable domains in the database |
@@ -157,9 +179,45 @@ Databases written by version 1.x are migrated automatically on first open.
 
 ---
 
+## 📡 Live Certificate Transparency (certstream)
+
+The `certstream` source holds a **persistent websocket** to a
+[certstream-server](https://github.com/d-Rickyy-b/certstream-server-go) and buffers every
+name it sees; each cycle drains the buffer. It understands both message shapes — the full
+`certificate_update` payload and the lighter `domains-only` feed — ignores heartbeats,
+strips wildcards, and reconnects with exponential backoff if the server hangs up.
+
+> ⚠️ **The public `certstream.calidog.io` server accepts connections but is frequently
+> idle** — it will connect and then send nothing. When that happens the source reports
+> `no certificates received`, goes on cooldown, and the other configured sources carry the
+> cycle. For a dependable live feed, run your own certstream-server-go and point
+> `--certstream-url` at it.
+
+---
+
+## 🔁 Re-check scheduling
+
+Domains are probed once when discovered. Set `recheck_after` and the producer also
+re-queues rows whose `checked_at` is older than that, oldest first, `recheck_batch` per
+cycle:
+
+```bash
+python domain_collector.py --headless --recheck-after 86400   # daily refresh
+python domain_collector.py --headless --recheck-after 604800 --recheck-only
+```
+
+A re-check **updates the existing row in place** — status, technologies, timing and
+`checked_at` — rather than inserting a duplicate. Technologies that disappeared are
+removed rather than merged, and a domain is never appended twice to the same
+`output/<technology>.txt`. Rows written by the 1.x collector have no `checked_at`, so they
+fall back to `first_seen` and are refreshed first.
+
+---
+
 ## 🧠 How it works
 
-1. **Producer** asks each configured source for candidates. A source that fails
+1. **Producer** re-queues any domains due for a re-check, then asks each configured
+   source for new candidates. A source that fails
    (crt.sh regularly returns HTTP 502) is put on an escalating cooldown while the
    others carry on — one dead feed never stops the run.
 2. Candidates are **normalised** (`https://Example.COM:8443/x` → `example.com`,
@@ -179,9 +237,10 @@ cycle brings *new* domains rather than re-probing the same first N entries.
 ## 🖥️ The GUI
 
 - Start / Pause / Resume / Stop, with buttons that enable and disable to match the state
-- Live counters: processed, responsive, unreachable, new, queue depth, probes per second
+- Live counters: processed, responsive, unreachable, new, re-checked, queue depth, probes/s
 - Live technology table and a colour-coded activity log (capped so it cannot eat memory)
-- **Settings** dialog that validates input and persists to `config.json`
+- **Settings** dialog (concurrency, timeouts, sources, certstream URL, re-check schedule)
+  that validates input and persists to `config.json`
 - **Export** button for the activity log
 - Closing the window stops collection cleanly instead of killing it mid-write
 
@@ -197,9 +256,10 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-111 tests cover domain normalisation, technology detection, the store (including 1.x
-database migration), source parsing and caching, the threaded runner, the CLI, and a full
-producer/consumer cycle against a real local HTTP server.
+140 tests cover domain normalisation, technology detection, the store (including 1.x
+database migration and re-check updates), source parsing and caching, certstream against a
+local websocket server, the threaded runner, the CLI, and full producer/consumer cycles
+against a real local HTTP server.
 
 ---
 

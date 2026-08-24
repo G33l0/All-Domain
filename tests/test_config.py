@@ -55,3 +55,19 @@ def test_load_broken_file_raises(workdir):
     path.write_text("{not json")
     with pytest.raises(ConfigError):
         Config.load(str(path))
+
+
+def test_certstream_url_must_be_a_websocket():
+    with pytest.raises(ConfigError, match="ws://"):
+        Config.from_dict({"certstream_url": "https://example.com"})
+    assert Config.from_dict({"certstream_url": "ws://host:1/x"}).certstream_url == "ws://host:1/x"
+
+
+def test_recheck_only_needs_a_recheck_interval():
+    with pytest.raises(ConfigError, match="recheck_after"):
+        Config.from_dict({"recheck_only": True})
+    assert Config.from_dict({"recheck_only": True, "recheck_after": 60}).recheck_only is True
+
+
+def test_recheck_defaults_to_disabled():
+    assert Config().validate().recheck_after == 0

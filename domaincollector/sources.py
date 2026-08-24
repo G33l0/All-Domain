@@ -13,6 +13,7 @@ first N entries over and over.
 from __future__ import annotations
 
 import asyncio
+import collections
 import csv
 import io
 import json
@@ -25,7 +26,7 @@ from typing import Dict, List, Optional, Sequence
 
 import aiohttp
 
-from .domains import normalize_all
+from .domains import normalize_all, normalize_domain
 from .httputil import read_capped
 
 __all__ = ["Source", "SourceError", "SOURCE_NAMES", "build_sources", "available_sources"]
@@ -89,6 +90,9 @@ class Source:
 
     async def fetch(self, session: "aiohttp.ClientSession", limit: int) -> List[str]:
         raise NotImplementedError
+
+    async def close(self) -> None:
+        """Release anything long-lived (streams, tasks).  Safe to call twice."""
 
     # -------------------------------------------------------------- utilities
     def _cache_path(self, filename: str) -> str:
@@ -287,6 +291,166 @@ class MajesticSource(_RankingListSource):
     domain_column = 2
 
 
+class CertStreamSource(Source):
+    """Live Certificate Transparency feed over a certstream websocket.
+
+    Unlike the polling sources this one holds a persistent connection: a
+    background task appends every streamed name to a bounded buffer, and each
+    fetch drains it.  That keeps the pull-based Source interface intact while
+    the stream runs continuously between cycles.
+
+    Both certstream message shapes are understood:
+
+    * full     - ``{"message_type": "certificate_update",
+                   "data": {"leaf_cert": {"all_domains": [...]}}}``
+    * domains-only - ``{"data": ["a.com", "b.com"]}``, a bare JSON list, or
+      plain newline-separated text.
+
+    The public ``certstream.calidog.io`` server accepts connections but is
+    frequently idle; point ``certstream_url`` at your own certstream-server-go
+    instance for a dependable feed.
+    """
+
+    name = "certstream"
+
+    def __init__(
+        self,
+        url: str = "wss://certstream.calidog.io/domains-only",
+        buffer_size: int = 20000,
+        wait: float = 15.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.url = url
+        self.buffer_size = max(1, int(buffer_size))
+        self.wait = max(1.0, float(wait))
+        self._buffer: "collections.deque[str]" = collections.deque(maxlen=self.buffer_size)
+        self._reader: Optional[asyncio.Task] = None
+        self._have_data = asyncio.Event()
+        self._connected = False
+        self._last_error: Optional[str] = None
+        self._closing = False
+        self.received = 0
+
+    # ------------------------------------------------------------------ fetch
+    async def fetch(self, session: "aiohttp.ClientSession", limit: int) -> List[str]:
+        self._ensure_reader(session)
+        if not self._buffer:
+            # Give a freshly opened stream a chance to produce something.
+            try:
+                await asyncio.wait_for(self._have_data.wait(), timeout=self.wait)
+            except asyncio.TimeoutError:
+                pass
+        if not self._buffer:
+            if self._last_error:
+                raise SourceError(f"certstream: {self._last_error}")
+            raise SourceError(
+                f"certstream: no certificates received from {self.url} within {self.wait:.0f}s"
+            )
+        drained: List[str] = []
+        while self._buffer and len(drained) < limit:
+            drained.append(self._buffer.popleft())
+        if not self._buffer:
+            self._have_data.clear()
+        return drained
+
+    def _ensure_reader(self, session: "aiohttp.ClientSession") -> None:
+        if self._closing:
+            return
+        if self._reader is None or self._reader.done():
+            self._reader = asyncio.create_task(self._stream(session), name="certstream-reader")
+
+    async def close(self) -> None:
+        self._closing = True
+        reader, self._reader = self._reader, None
+        if reader is not None and not reader.done():
+            reader.cancel()
+            try:
+                await reader
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # ----------------------------------------------------------------- stream
+    async def _stream(self, session: "aiohttp.ClientSession") -> None:
+        """Stay connected, reconnecting with backoff until the source closes."""
+        attempt = 0
+        while not self._closing:
+            try:
+                async with session.ws_connect(
+                    self.url, heartbeat=30, timeout=aiohttp.ClientWSTimeout(ws_close=30)
+                ) as websocket:
+                    self._connected = True
+                    self._last_error = None
+                    attempt = 0
+                    async for message in websocket:
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            self._ingest(message.data)
+                        elif message.type == aiohttp.WSMsgType.BINARY:
+                            self._ingest(message.data.decode("utf-8", errors="ignore"))
+                        elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+                        if self._closing:
+                            break
+                self._last_error = "stream closed by the server"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._last_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+            self._connected = False
+            if self._closing:
+                break
+            attempt += 1
+            await asyncio.sleep(min(2 ** attempt, 60))
+
+    def _ingest(self, payload: str) -> None:
+        for candidate in _parse_certstream(payload):
+            domain = normalize_domain(candidate)
+            if domain:
+                self._buffer.append(domain)
+                self.received += 1
+        if self._buffer:
+            self._have_data.set()
+
+
+def _parse_certstream(payload: str) -> List[str]:
+    """Pull host names out of any certstream message shape."""
+    payload = (payload or "").strip()
+    if not payload:
+        return []
+    if payload[0] not in "{[":
+        # domains-only servers may emit plain text
+        return [line.strip() for line in payload.splitlines() if line.strip()]
+    try:
+        message = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(message, list):
+        return [str(item) for item in message]
+    if not isinstance(message, dict):
+        return []
+    if message.get("message_type") == "heartbeat":
+        return []
+    data = message.get("data")
+    if isinstance(data, list):
+        return [str(item) for item in data]
+    names: List[str] = []
+    if isinstance(data, dict):
+        leaf = data.get("leaf_cert")
+        if isinstance(leaf, dict):
+            for key in ("all_domains", "domains"):
+                values = leaf.get(key)
+                if isinstance(values, list):
+                    names.extend(str(item) for item in values)
+            subject = leaf.get("subject")
+            if isinstance(subject, dict) and subject.get("CN"):
+                names.append(str(subject["CN"]))
+        for key in ("all_domains", "domains"):
+            values = data.get(key)
+            if isinstance(values, list):
+                names.extend(str(item) for item in values)
+    return names
+
+
 class SeedFileSource(Source):
     """Read candidate domains from a local file (one per line)."""
 
@@ -314,6 +478,7 @@ class SeedFileSource(Source):
 
 SOURCE_CLASSES: Dict[str, type] = {
     CrtShSource.name: CrtShSource,
+    CertStreamSource.name: CertStreamSource,
     TrancoSource.name: TrancoSource,
     UmbrellaSource.name: UmbrellaSource,
     MajesticSource.name: MajesticSource,
@@ -339,6 +504,16 @@ def build_sources(config) -> List[Source]:
         cls = SOURCE_CLASSES.get(name)
         if cls is None:
             raise ValueError(f"unknown source {name!r}; valid sources: {', '.join(SOURCE_NAMES)}")
+        if cls is CertStreamSource:
+            sources.append(
+                CertStreamSource(
+                    url=config.certstream_url,
+                    buffer_size=config.certstream_buffer,
+                    wait=config.certstream_wait,
+                    **kwargs,
+                )
+            )
+            continue
         sources.append(cls(**kwargs))
     if config.seed_file and not any(isinstance(s, SeedFileSource) for s in sources):
         sources.insert(0, SeedFileSource(config.seed_file, **kwargs))
