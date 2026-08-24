@@ -1,0 +1,57 @@
+import json
+
+import pytest
+
+from domaincollector.config import Config, ConfigError
+
+
+def test_defaults_are_valid():
+    config = Config().validate()
+    assert config.concurrency > 0
+    assert config.sources
+
+
+@pytest.mark.parametrize(
+    "payload,message",
+    [
+        ({"concurrency": 0}, "concurrency"),
+        ({"concurrency": "abc"}, "concurrency"),
+        ({"http_timeout": 0}, "http_timeout"),
+        ({"fetch_interval": 1}, "fetch_interval"),
+        ({"log_level": "LOUD"}, "log_level"),
+        ({"db_path": "  "}, "db_path"),
+        ({"nonsense": 1}, "unknown configuration key"),
+    ],
+)
+def test_invalid_values_are_rejected(payload, message):
+    with pytest.raises(ConfigError) as excinfo:
+        Config.from_dict(payload)
+    assert message in str(excinfo.value)
+
+
+def test_sources_accept_a_comma_string_and_deduplicate():
+    config = Config.from_dict({"sources": "crtsh, tranco ,crtsh"})
+    assert config.sources == ["crtsh", "tranco"]
+
+
+def test_save_and_load_round_trip(workdir):
+    path = workdir / "cfg.json"
+    original = Config(concurrency=42, sources=["tranco"], log_level="DEBUG")
+    original.save(str(path))
+    loaded = Config.load(str(path))
+    assert loaded.concurrency == 42
+    assert loaded.sources == ["tranco"]
+    assert loaded.log_level == "DEBUG"
+    assert json.loads(path.read_text())["concurrency"] == 42
+    assert not (workdir / "cfg.json.tmp").exists()
+
+
+def test_load_missing_file_returns_defaults(workdir):
+    assert Config.load(str(workdir / "absent.json")).concurrency == Config().concurrency
+
+
+def test_load_broken_file_raises(workdir):
+    path = workdir / "broken.json"
+    path.write_text("{not json")
+    with pytest.raises(ConfigError):
+        Config.load(str(path))

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "domain-collector"
+version = "2.0.0"
+description = "Asynchronous domain discovery and technology fingerprinting"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "IamG2ont" }]
+keywords = ["osint", "recon", "domains", "certificate-transparency", "fingerprinting"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Security",
+]
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "aiosqlite>=0.19",
+    "idna>=3.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+domain-collector = "domaincollector.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/G33l0/All-Domain"
+
+[tool.setuptools]
+packages = ["domaincollector"]
+py-modules = ["domain_collector"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-q"
