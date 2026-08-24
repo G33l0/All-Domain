@@ -2,12 +2,17 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python Version">
+  <img src="https://img.shields.io/badge/UI-PySide6%20%2F%20Qt%206-41cd52.svg" alt="PySide6">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/status-active-brightgreen" alt="Status">
-  <img src="https://img.shields.io/badge/tests-140%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-161%20passing-brightgreen" alt="Tests">
 </p>
 
 > *Autonomous, asynchronous domain intelligence & technology fingerprinting framework*
+
+<p align="center">
+  <img src="docs/screenshots/dashboard-dark.png" alt="Domain Collector dashboard, dark theme" width="820">
+</p>
 
 ---
 
@@ -15,7 +20,8 @@ Domain Collector continuously discovers domains from public feeds, checks whethe
 answer over HTTP/HTTPS, fingerprints the technology stack behind them, and files the
 results into a SQLite database and technology-specific text files — with no duplicates.
 
-It runs either as a **desktop GUI** or **fully headless in a terminal**.
+It runs as a **native-feeling desktop app** (PySide6 / Qt 6, with a Tk fallback) or
+**fully headless in a terminal**.
 
 ---
 
@@ -45,24 +51,36 @@ cd All-Domain
 pip install -r requirements.txt
 ```
 
-Requirements: **Python 3.9+**, `aiohttp`, `aiosqlite`, `idna`.
+Requirements: **Python 3.9+**, `aiohttp`, `aiosqlite`, `idna`, and `PySide6` for the
+desktop app. On Windows that is all you need — `pip install PySide6` pulls in Qt 6 itself.
 
-The GUI additionally needs Tk, which some Python builds ship separately:
+The collector picks an interface automatically: **Qt if PySide6 is installed**, otherwise
+the built-in **Tk** fallback, otherwise **headless**. Force one with `--ui qt` / `--ui tk`.
+
+<details>
+<summary>Running the Tk fallback instead</summary>
+
+Some Python builds ship Tk separately:
 
 ```bash
 sudo apt install python3-tk      # Debian / Ubuntu
 sudo dnf install python3-tkinter # Fedora
 ```
 
-Without Tk the collector still runs — it just goes straight to headless mode.
+Linux users running the Qt app on a bare container may also need
+`libegl1 libgl1 libxkbcommon0 libdbus-1-3` — desktop installs already have them.
+</details>
 
 ---
 
 ## 🚀 Usage
 
 ```bash
-# Desktop GUI (falls back to headless if Tk is missing)
+# Desktop app (Qt when PySide6 is installed, else Tk, else headless)
 python domain_collector.py
+
+# Pick the interface and theme explicitly
+python domain_collector.py --ui qt --theme dark
 
 # Headless, runs until you press Ctrl+C
 python domain_collector.py --headless
@@ -95,7 +113,9 @@ database and HTTP sessions are closed. Press it twice to force an immediate exit
 
 | Option | Description |
 |---|---|
-| `--headless`, `--no-gui` | Run in the terminal instead of opening the GUI |
+| `--headless`, `--no-gui` | Run in the terminal instead of opening the desktop app |
+| `--ui {auto,qt,tk}` | Which desktop interface to use |
+| `--theme {system,light,dark}` | Qt colour theme (default: follow the OS) |
 | `--once` / `--cycles N` | Stop after one / N fetch cycles |
 | `--concurrency N` | Simultaneous probes (default 20) |
 | `--timeout SECONDS` | Per-request timeout (default 10) |
@@ -234,18 +254,47 @@ cycle brings *new* domains rather than re-probing the same first N entries.
 
 ---
 
-## 🖥️ The GUI
+## 🖥️ The desktop app
 
-- Start / Pause / Resume / Stop, with buttons that enable and disable to match the state
-- Live counters: processed, responsive, unreachable, new, re-checked, queue depth, probes/s
-- Live technology table and a colour-coded activity log (capped so it cannot eat memory)
-- **Settings** dialog (concurrency, timeouts, sources, certstream URL, re-check schedule)
-  that validates input and persists to `config.json`
-- **Export** button for the activity log
-- Closing the window stops collection cleanly instead of killing it mid-write
+Built with **PySide6 (Qt 6)** and styled to match Windows 11 / Fluent, so it looks at home
+on Windows and identical on Linux and macOS.
 
-The engine runs on its own event loop in a worker thread and communicates with Tk through
-a queue — no widget is ever touched from a background thread.
+| | |
+|---|---|
+| ![Light theme](docs/screenshots/dashboard-light.png) | ![Settings](docs/screenshots/settings-dark.png) |
+
+- **Sidebar navigation** — Dashboard, Domains, Technologies, Activity log, Settings
+- **Light / dark / follow-the-system** theming, switched live from the sidebar; on Qt 6.5+
+  it follows the OS the moment you change it in Windows Settings
+- **Dashboard** with live stat cards (probed, live, unreachable, new, re-checked, queue),
+  a rolling feed of recent domains and a ranked technology chart
+- **Domains page** — sortable table, instant search across domains *and* technologies,
+  a "live only" toggle, and CSV export of whatever the filter is showing
+- **Technologies page** — every detected technology with a share bar, filterable, plus a
+  shortcut to the output folder
+- **Activity log** — colour-coded by severity, capped at 3000 lines, saveable to a file
+- **Settings page** — every option with proper spin boxes, validation and inline errors,
+  saved to `config.json`
+- Crisp high-DPI icons (inline SVG, no image assets), system tray icon, remembered window
+  size and position, and a close prompt that stops collection cleanly
+
+The engine runs on its own event loop in a worker thread; the window drains its event
+queue from a `QTimer`, so no Qt object is ever touched from the collector thread.
+
+### Building a Windows .exe
+
+```powershell
+pip install pyinstaller PySide6
+pyinstaller packaging/domain-collector.spec
+```
+
+That produces `dist/DomainCollector.exe` — a single file that opens the app with no
+console window. Pass `--headless` to the same binary to use it as a CLI.
+
+### The Tk fallback
+
+The original Tk interface is still there for environments without PySide6 (`--ui tk`).
+It carries the same controls, counters, log and settings, in a plainer package.
 
 ---
 
@@ -256,10 +305,11 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-140 tests cover domain normalisation, technology detection, the store (including 1.x
+161 tests cover domain normalisation, technology detection, the store (including 1.x
 database migration and re-check updates), source parsing and caching, certstream against a
-local websocket server, the threaded runner, the CLI, and full producer/consumer cycles
-against a real local HTTP server.
+local websocket server, the threaded runner, the CLI, the Qt interface (models, theming,
+filtering, settings round-trip — run offscreen, skipped when PySide6 is absent), and full
+producer/consumer cycles against a real local HTTP server.
 
 ---
 

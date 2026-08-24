@@ -13,6 +13,9 @@ authors = [{ name = "IamG2ont" }]
 keywords = ["osint", "recon", "domains", "certificate-transparency", "fingerprinting"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Environment :: X11 Applications :: Qt",
+    "Environment :: Win32 (MS Windows)",
+    "Operating System :: OS Independent",
     "License :: OSI Approved :: MIT License",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Security",
@@ -24,16 +27,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-asyncio>=0.21"]
+gui = ["PySide6>=6.5"]
+dev = ["pytest>=7", "pytest-asyncio>=0.21", "PySide6>=6.5"]
+build = ["pyinstaller>=6.0"]
 
 [project.scripts]
 domain-collector = "domaincollector.cli:main"
+
+# gui-scripts produces a launcher with no console window on Windows.
+[project.gui-scripts]
+domain-collector-gui = "domaincollector.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/G33l0/All-Domain"
 
 [tool.setuptools]
-packages = ["domaincollector"]
+packages = ["domaincollector", "domaincollector.qtui"]
 py-modules = ["domain_collector"]
 
 [tool.pytest.ini_options]

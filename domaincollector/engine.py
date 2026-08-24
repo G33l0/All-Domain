@@ -573,6 +573,7 @@ class Collector:
                             "technologies": result.technologies,
                             "status": result.status_code,
                             "source": source_name,
+                            "recheck": is_recheck,
                         },
                     )
                 )

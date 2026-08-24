@@ -34,8 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"domain-collector {__version__}")
     parser.add_argument("-c", "--config", default=DEFAULT_CONFIG_PATH, help="path to the JSON config file")
     parser.add_argument("--headless", "--no-gui", dest="headless", action="store_true",
-                        help="run in the terminal instead of opening the GUI")
-    parser.add_argument("--gui", dest="gui", action="store_true", help="force the GUI")
+                        help="run in the terminal instead of opening the desktop app")
+    parser.add_argument("--gui", dest="gui", action="store_true", help="force the desktop app")
+    parser.add_argument("--ui", choices=["auto", "qt", "tk"], default="auto",
+                        help="which desktop interface to use: the modern Qt/PySide6 app, "
+                             "the built-in Tk fallback, or whichever is available")
+    parser.add_argument("--theme", choices=["system", "light", "dark"], default=None,
+                        help="Qt interface colour theme (default: follow the OS)")
     parser.add_argument("--once", action="store_true", help="run a single fetch cycle, then exit")
     parser.add_argument("--cycles", type=int, default=None, metavar="N", help="stop after N fetch cycles")
     parser.add_argument("--concurrency", type=int, default=None, help="number of concurrent probes")
@@ -189,6 +194,55 @@ async def run_export(config: Config, technology: str) -> int:
     return 0
 
 
+def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
+    """Open a desktop interface.  Returns an exit code, or None to fall back."""
+    from .qtui import pyside_available, run_qt_gui
+
+    if cycles is not None:
+        print("--once/--cycles only apply to headless mode; ignoring.", file=sys.stderr)
+
+    want = args.ui
+    if want in ("auto", "qt") and pyside_available():
+        try:
+            return run_qt_gui(config, args.config, theme=args.theme)
+        except Exception as exc:  # pragma: no cover - display problems
+            print(f"Qt interface could not start ({exc}).", file=sys.stderr)
+            if want == "qt":
+                return 1
+
+    if want == "qt":
+        from .qtui import import_error
+
+        print(
+            "The Qt interface needs PySide6.  Install it with:  pip install PySide6\n"
+            f"(import failed with: {import_error()})",
+            file=sys.stderr,
+        )
+        return 1
+
+    from .gui import run_gui, tkinter_available
+
+    if tkinter_available():
+        try:
+            return run_gui(config, args.config)
+        except Exception as exc:  # pragma: no cover - display problems
+            print(f"Tk interface could not start ({exc}).", file=sys.stderr)
+            if want == "tk":
+                return 1
+    elif want == "tk":
+        from .gui import run_gui as _run_gui
+
+        try:
+            _run_gui(config, args.config)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+        return 1
+
+    print("No desktop toolkit available (install PySide6 for the full app) - "
+          "running headless. Use --headless to silence this notice.", file=sys.stderr)
+    return None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -220,26 +274,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     want_gui = args.gui or not args.headless
     if want_gui:
-        from .gui import run_gui, tkinter_available
-
-        if tkinter_available():
-            if cycles is not None:
-                print("--once/--cycles only apply to headless mode; ignoring.", file=sys.stderr)
-            try:
-                return run_gui(config, args.config)
-            except Exception as exc:  # pragma: no cover - display problems
-                print(f"GUI could not start ({exc}); falling back to headless mode.", file=sys.stderr)
-        elif args.gui:
-            from .gui import run_gui
-
-            try:
-                run_gui(config, args.config)
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                return 1
-        else:
-            print("tkinter not available - running headless. Use --headless to silence this notice.",
-                  file=sys.stderr)
+        exit_code = _run_desktop(args, config, cycles)
+        if exit_code is not None:
+            return exit_code
 
     try:
         return asyncio.run(run_headless(config, cycles))
