@@ -1,4 +1,4 @@
-"""The Domain Collector desktop window.
+"""The Domain Atlas desktop window.
 
 The engine keeps running in its own thread (:class:`CollectorThread`); this
 window drains its event queue from a ``QTimer`` on the GUI thread, so no Qt
@@ -11,7 +11,7 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QSettings, QSize, Qt, QTimer, Slot
+from PySide6.QtCore import QSettings, QSize, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QTextCharFormat, QTextCursor
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -46,16 +46,19 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..config import Config, ConfigError, DEFAULT_CONFIG_PATH
 from ..engine import Event
+from ..query import ORDER_NEWEST, DomainFilter
 from ..runner import CollectorThread
-from ..sources import SOURCE_NAMES
-from .icons import app_icon, make_icon
+from ..sources import available_sources
+from .browser import ExportTask, StoredDomainModel, start_browser
+from .icons import make_icon
+from .logo import logo_icon
 from .models import (
     DomainFilterProxy,
     DomainTableModel,
     TechnologyFilterProxy,
     TechnologyTableModel,
 )
-from .theme import Palette, apply_qpalette, palette_for, stylesheet
+from .theme import Palette, apply_qpalette, palette_for, stylesheet, theme_labels
 from .widgets import Card, NavButton, SearchBox, ShareBarDelegate, StatCard, StatusDotDelegate, StatusPill
 
 POLL_MS = 250
@@ -63,6 +66,10 @@ MAX_LOG_BLOCKS = 3000
 
 
 class MainWindow(QMainWindow):
+    open_database = Signal(str)
+    request_facets = Signal()
+    request_summary = Signal()
+
     def __init__(self, config: Config, config_path: str = DEFAULT_CONFIG_PATH,
                  theme: str = "system") -> None:
         super().__init__()
@@ -74,7 +81,7 @@ class MainWindow(QMainWindow):
         self._state = "stopped"
         self._tray: Optional[QSystemTrayIcon] = None
 
-        self.setWindowTitle("Domain Collector")
+        self.setWindowTitle("Domain Atlas")
         self.setMinimumSize(QSize(1040, 660))
         self.resize(1240, 780)
 
@@ -84,8 +91,10 @@ class MainWindow(QMainWindow):
         self.tech_model = TechnologyTableModel()
         self.tech_proxy = TechnologyFilterProxy(self)
         self.tech_proxy.setSourceModel(self.tech_model)
+        self.stored_model = StoredDomainModel(self)
 
         self._build_ui()
+        self._connect_browser()
         self._build_tray()
         self.apply_theme(self.palette_)
         self._restore_geometry()
@@ -125,8 +134,10 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status_left = QLabel("Ready")
+        self.status_database = QLabel("")
         self.status_right = QLabel("")
         self.status.addWidget(self.status_left, 1)
+        self.status.addPermanentWidget(self.status_database)
         self.status.addPermanentWidget(self.status_right)
 
     def _build_sidebar(self) -> QWidget:
@@ -143,7 +154,7 @@ class MainWindow(QMainWindow):
         self.brand_icon.setFixedSize(34, 34)
         titles = QVBoxLayout()
         titles.setSpacing(0)
-        title = QLabel("Domain Collector")
+        title = QLabel("Domain Atlas")
         title.setObjectName("appTitle")
         subtitle = QLabel(f"v{__version__}")
         subtitle.setObjectName("appSubtitle")
@@ -168,8 +179,10 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Follow system", "Light", "Dark"])
-        self.theme_combo.setCurrentIndex({"system": 0, "light": 1, "dark": 2}.get(self.theme_name, 0))
+        self._theme_keys = ["system"] + [key for key, _label in theme_labels()]
+        self.theme_combo.addItems(["Follow system"] + [label for _key, label in theme_labels()])
+        if self.theme_name in self._theme_keys:
+            self.theme_combo.setCurrentIndex(self._theme_keys.index(self.theme_name))
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         layout.addWidget(QLabel("Appearance"))
         layout.addWidget(self.theme_combo)
@@ -252,23 +265,77 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        card = Card("Probed domains")
-        self.domain_search = SearchBox("Filter domains or technologies…", self.palette_.text_muted)
-        self.domain_search.setFixedWidth(280)
-        self.domain_search.textChanged.connect(self._apply_domain_filter)
-        card.add_header_widget(self.domain_search)
-        self.only_live = QCheckBox("Live only")
-        self.only_live.toggled.connect(self._apply_domain_filter)
-        card.add_header_widget(self.only_live)
-        export_button = QPushButton("  Export CSV")
-        export_button.clicked.connect(self.export_domains)
-        self.btn_export_domains = export_button
-        card.add_header_widget(export_button)
+        card = Card("Stored domains")
 
-        self.domain_table = self._make_domain_table(compact=False)
-        card.add_widget(self.domain_table, 1)
+        self.btn_refresh = QPushButton("  Refresh")
+        self.btn_refresh.clicked.connect(self.reload_stored)
+        card.add_header_widget(self.btn_refresh)
+        self.btn_export_domains = QPushButton("  Export")
+        self.btn_export_domains.clicked.connect(self.export_domains)
+        card.add_header_widget(self.btn_export_domains)
+
+        filters = QWidget()
+        filter_row = QHBoxLayout(filters)
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(8)
+
+        self.domain_search = SearchBox("Search domains…", self.palette_.text_muted)
+        self.domain_search.setMinimumWidth(240)
+        self.domain_search.textChanged.connect(self._schedule_reload)
+        filter_row.addWidget(self.domain_search, 1)
+
+        self.filter_technology = QComboBox()
+        self.filter_technology.setMinimumWidth(160)
+        self.filter_technology.addItem("Any technology", None)
+        self.filter_technology.currentIndexChanged.connect(self._schedule_reload)
+        filter_row.addWidget(self.filter_technology)
+
+        self.filter_source = QComboBox()
+        self.filter_source.setMinimumWidth(130)
+        self.filter_source.addItem("Any source", None)
+        self.filter_source.currentIndexChanged.connect(self._schedule_reload)
+        filter_row.addWidget(self.filter_source)
+
+        self.filter_status = QComboBox()
+        self.filter_status.setMinimumWidth(120)
+        for label, value in (("Any status", None), ("Live only", True), ("Down only", False)):
+            self.filter_status.addItem(label, value)
+        self.filter_status.currentIndexChanged.connect(self._schedule_reload)
+        filter_row.addWidget(self.filter_status)
+
+        self.filter_network = QComboBox()
+        self.filter_network.setMinimumWidth(130)
+        for label, value in (("All networks", None), ("Clear web", False), ("Tor (.onion)", True)):
+            self.filter_network.addItem(label, value)
+        self.filter_network.currentIndexChanged.connect(self._schedule_reload)
+        filter_row.addWidget(self.filter_network)
+
+        self.btn_clear_filters = QPushButton("Clear")
+        self.btn_clear_filters.clicked.connect(self.clear_filters)
+        filter_row.addWidget(self.btn_clear_filters)
+
+        card.add_widget(filters)
+
+        self.stored_table = self._make_stored_table()
+        card.add_widget(self.stored_table, 1)
+
+        self.result_label = QLabel("No database opened yet.")
+        self.result_label.setObjectName("pageSubtitle")
+        card.add_widget(self.result_label)
+
         layout.addWidget(card, 1)
         return page
+
+    def clear_filters(self) -> None:
+        for combo in (self.filter_technology, self.filter_source,
+                      self.filter_status, self.filter_network):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.domain_search.blockSignals(True)
+        self.domain_search.clear()
+        self.domain_search.blockSignals(False)
+        self.reload_stored()
 
     def _build_tech_page(self) -> QWidget:
         page = QWidget()
@@ -347,7 +414,7 @@ class MainWindow(QMainWindow):
         sources_layout = QVBoxLayout(sources)
         sources_layout.setSpacing(6)
         self.source_checks: Dict[str, QCheckBox] = {}
-        for name in SOURCE_NAMES:
+        for name in available_sources():
             if name == "file":
                 continue
             box = QCheckBox(name)
@@ -357,6 +424,13 @@ class MainWindow(QMainWindow):
         sources_layout.addWidget(QLabel("Certstream URL"))
         self.in_certstream = QLineEdit()
         sources_layout.addWidget(self.in_certstream)
+        sources_layout.addWidget(QLabel("Onion index URL"))
+        self.in_onion_index = QLineEdit()
+        sources_layout.addWidget(self.in_onion_index)
+        sources_layout.addWidget(QLabel("Tor SOCKS proxy (blank = .onion stored, not probed)"))
+        self.in_tor_proxy = QLineEdit()
+        self.in_tor_proxy.setPlaceholderText("socks5://127.0.0.1:9050")
+        sources_layout.addWidget(self.in_tor_proxy)
         sources_layout.addWidget(QLabel("Seed file (optional)"))
         seed_row = QHBoxLayout()
         self.in_seed = QLineEdit()
@@ -444,6 +518,30 @@ class MainWindow(QMainWindow):
         table.status_delegate = delegate  # keep a reference for retinting
         return table
 
+    def _make_stored_table(self) -> QTableView:
+        table = QTableView()
+        table.setModel(self.stored_model)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        header = table.horizontalHeader()
+        header.setStretchLastSection(True)
+        table.setColumnWidth(0, 260)
+        table.setColumnWidth(1, 90)
+        table.setColumnWidth(2, 70)
+        table.setColumnWidth(3, 110)
+        table.setColumnWidth(4, 150)
+        delegate = StatusDotDelegate(StoredDomainModel.ROLE_RESPONSIVE,
+                                     self.palette_.success, self.palette_.text_faint, table)
+        table.setItemDelegateForColumn(1, delegate)
+        table.status_delegate = delegate
+        return table
+
     def _make_tech_table(self) -> QTableView:
         table = QTableView()
         table.setModel(self.tech_proxy)
@@ -473,8 +571,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             apply_qpalette(app, palette)
             app.setStyleSheet(stylesheet(palette))
-        icon = app_icon(palette.accent_text if palette.name == "light" else "#0b2739",
-                        palette.accent)
+        icon = logo_icon()
         self.setWindowIcon(icon)
         self.brand_icon.setPixmap(icon.pixmap(30, 30))
         if self._tray is not None:
@@ -488,7 +585,7 @@ class MainWindow(QMainWindow):
         self.btn_save_log.setIcon(make_icon("export", palette.text, 15))
         self.btn_open_output.setIcon(make_icon("refresh", palette.text, 15))
         self.status_pill.set_palette_colors(palette)
-        for table in (self.recent_table, self.domain_table):
+        for table in (self.recent_table, self.stored_table):
             table.status_delegate.set_colors(palette.success, palette.text_faint)
         for table in (self.dash_tech_table, self.tech_table):
             table.share_delegate.set_colors(palette.accent, palette.surface_hover)
@@ -496,16 +593,126 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_theme_changed(self, index: int) -> None:
-        self.theme_name = {0: "system", 1: "light", 2: "dark"}.get(index, "system")
+        if 0 <= index < len(self._theme_keys):
+            self.theme_name = self._theme_keys[index]
         self.apply_theme(palette_for(self.theme_name))
-        QSettings("DomainCollector", "DomainCollector").setValue("theme", self.theme_name)
+        QSettings("DomainAtlas", "DomainAtlas").setValue("theme", self.theme_name)
+
+    # --------------------------------------------------------------- browser
+    def _connect_browser(self) -> None:
+        self.browser_thread, self.browser = start_browser(self.config.db_path)
+        application = QApplication.instance()
+        if application is not None:
+            application.aboutToQuit.connect(self.shutdown_browser)
+        self.open_database.connect(self.browser.open)
+        self.request_facets.connect(self.browser.fetch_facets)
+        self.request_summary.connect(self.browser.fetch_summary)
+        self.stored_model.request_page.connect(self.browser.fetch_page)
+        self.stored_model.request_count.connect(self.browser.fetch_count)
+        self.browser.page_ready.connect(self.stored_model.on_page)
+        self.browser.count_ready.connect(self.stored_model.on_count)
+        self.browser.page_ready.connect(self._on_page_loaded)
+        self.browser.count_ready.connect(self._on_count_loaded)
+        self.browser.facets_ready.connect(self._on_facets)
+        self.browser.summary_ready.connect(self._on_summary)
+        self.browser.failed.connect(self._on_browser_error)
+
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(300)
+        self._reload_timer.timeout.connect(self.reload_stored)
+
+        self.open_database.emit(self.config.db_path)
+        self.reload_stored()
+        self.request_facets.emit()
+        self.request_summary.emit()
+
+    def current_filter(self) -> DomainFilter:
+        """The filter described by the controls on the Domains page."""
+        return DomainFilter(
+            text=self.domain_search.text().strip(),
+            technology=self.filter_technology.currentData(),
+            source=self.filter_source.currentData(),
+            responsive=self.filter_status.currentData(),
+            onion=self.filter_network.currentData(),
+        )
+
+    def _schedule_reload(self) -> None:
+        self._reload_timer.start()
+
+    @Slot()
+    def reload_stored(self) -> None:
+        self._counted = False
+        self.result_label.setText("Loading…")
+        self.stored_model.reload(self.current_filter(), ORDER_NEWEST)
+
+    @Slot(int, list, bool)
+    def _on_page_loaded(self, request_id: int, rows: list, has_more: bool) -> None:
+        self._update_result_label()
+
+    @Slot(int, int, bool)
+    def _on_count_loaded(self, request_id: int, total: int, capped: bool) -> None:
+        self._counted = True
+        self._update_result_label()
+
+    def _update_result_label(self) -> None:
+        loaded = self.stored_model.loaded_count()
+        total = self.stored_model.total
+        if loaded and not getattr(self, "_counted", False):
+            self.result_label.setText(f"Showing {loaded:,} domains, counting…")
+            return
+        if total == 0 and loaded == 0:
+            criteria = self.current_filter()
+            self.result_label.setText(
+                "No domains match this filter." if not criteria.is_empty()
+                else "No domains stored yet - press Start to begin collecting."
+            )
+            return
+        total_text = f"{total:,}+" if self.stored_model.total_capped else f"{total:,}"
+        self.result_label.setText(f"Showing {loaded:,} of {total_text} matching domains")
+
+    @Slot(list, list)
+    def _on_facets(self, technologies: list, sources: list) -> None:
+        self._refill_combo(self.filter_technology, "Any technology", technologies)
+        self._refill_combo(self.filter_source, "Any source", sources)
+
+    @staticmethod
+    def _refill_combo(combo: QComboBox, placeholder: str, values: list) -> None:
+        previous = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(placeholder, None)
+        for value in values:
+            combo.addItem(str(value), value)
+        if previous is not None:
+            index = combo.findData(previous)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    @Slot(dict)
+    def _on_summary(self, summary: dict) -> None:
+        self.stored_summary = summary
+        onion = summary.get("onion", 0)
+        extra = f"   ·   {onion:,} .onion" if onion else ""
+        self.status_database.setText(
+            f"{summary.get('total', 0):,} stored   ·   "
+            f"{summary.get('responsive', 0):,} live   ·   "
+            f"{summary.get('technologies', 0):,} technologies{extra}   "
+        )
+
+    @Slot(str)
+    def _on_browser_error(self, message: str) -> None:
+        if "no database" in message.lower():
+            self.result_label.setText("No database yet - press Start to begin collecting.")
+            return
+        self.log(f"Database: {message}", "ERROR")
 
     # ------------------------------------------------------------------ tray
     def _build_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self._tray = QSystemTrayIcon(self)
-        self._tray.setToolTip("Domain Collector")
+        self._tray.setToolTip("Domain Atlas")
         self._tray.activated.connect(lambda _reason: self.showNormal())
         self._tray.show()
 
@@ -520,7 +727,7 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         titles = [
             ("Dashboard", "Live discovery and technology fingerprinting"),
-            ("Domains", "Every domain probed in this session"),
+            ("Domains", "Everything stored, searchable and filterable"),
             ("Technologies", "What the live domains are built with"),
             ("Activity log", "Everything the collector reported"),
             ("Settings", "Applied to this run and saved to your config file"),
@@ -533,6 +740,8 @@ class MainWindow(QMainWindow):
             return
         self.collector.update_config(self.config)
         self.collector.start()
+        # The database file may not have existed when the window opened.
+        self.open_database.emit(self.config.db_path)
         if self.collector.error is not None:
             QMessageBox.critical(self, "Cannot start", str(self.collector.error))
             self._set_state("stopped")
@@ -564,39 +773,54 @@ class MainWindow(QMainWindow):
         self._set_state("stopped")
 
     def export_domains(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export domains", f"domains-{datetime.now():%Y%m%d-%H%M%S}.csv",
-            "CSV files (*.csv);;All files (*)")
+        criteria = self.current_filter()
+        suggestion = "domains"
+        if criteria.technology:
+            suggestion = criteria.technology.lower().replace(" ", "-")
+        path, selected = QFileDialog.getSaveFileName(
+            self,
+            "Export domains",
+            f"{suggestion}-{datetime.now():%Y%m%d-%H%M%S}.csv",
+            "CSV (*.csv);;JSON (*.json);;JSON Lines (*.jsonl);;Domain list (*.txt)",
+        )
         if not path:
             return
-        try:
-            with open(path, "w", encoding="utf-8", newline="") as handle:
-                handle.write("domain,responsive,status,source,technologies\n")
-                for row in self._visible_domain_rows():
-                    technologies = " ".join(row["technologies"])
-                    handle.write(
-                        f"{row['domain']},{int(row['responsive'])},"
-                        f"{row['status'] if row['status'] is not None else ''},"
-                        f"{row['source']},{technologies}\n"
-                    )
-        except OSError as exc:
-            QMessageBox.warning(self, "Export failed", str(exc))
-            return
-        self.status_left.setText(f"Exported {self.domain_model.rowCount()} domains to {path}")
 
-    def _visible_domain_rows(self) -> List[dict]:
-        """Rows currently shown, in view order (so exports match the filter)."""
-        rows = self.domain_model.rows()
-        visible = []
-        for proxy_row in range(self.domain_proxy.rowCount()):
-            source_row = self.domain_proxy.mapToSource(self.domain_proxy.index(proxy_row, 0)).row()
-            if 0 <= source_row < len(rows):
-                visible.append(rows[source_row])
-        return visible
+        from ..export import format_for_path
+
+        export_format = format_for_path(path)
+        if selected.startswith("JSON Lines"):
+            export_format = "jsonl"
+        elif selected.startswith("JSON"):
+            export_format = "json"
+        elif selected.startswith("Domain list"):
+            export_format = "txt"
+        elif selected.startswith("CSV"):
+            export_format = "csv"
+
+        task = ExportTask(self.config.db_path, path, criteria, export_format)
+        task.signals.finished.connect(self._on_export_finished)
+        task.signals.failed.connect(self._on_export_failed)
+        self.btn_export_domains.setEnabled(False)
+        self.result_label.setText(f"Exporting to {path}…")
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(int, str)
+    def _on_export_finished(self, written: int, path: str) -> None:
+        self.btn_export_domains.setEnabled(True)
+        self.log(f"Exported {written:,} domains to {path}", "GOOD")
+        self.status_left.setText(f"Exported {written:,} domains to {path}")
+        self._update_result_label()
+
+    @Slot(str)
+    def _on_export_failed(self, message: str) -> None:
+        self.btn_export_domains.setEnabled(True)
+        QMessageBox.warning(self, "Export failed", message)
+        self._update_result_label()
 
     def export_log(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save activity log", f"domain-collector-{datetime.now():%Y%m%d-%H%M%S}.log",
+            self, "Save activity log", f"domain-atlas-{datetime.now():%Y%m%d-%H%M%S}.log",
             "Log files (*.log);;Text files (*.txt);;All files (*)")
         if not path:
             return
@@ -636,6 +860,8 @@ class MainWindow(QMainWindow):
         self.in_db.setText(config.db_path)
         self.in_output.setText(config.output_dir)
         self.in_certstream.setText(config.certstream_url)
+        self.in_onion_index.setText(config.onion_index_url)
+        self.in_tor_proxy.setText(config.tor_proxy)
         self.in_seed.setText(config.seed_file or "")
         for name, box in self.source_checks.items():
             box.setChecked(name in config.sources)
@@ -656,6 +882,8 @@ class MainWindow(QMainWindow):
         candidate.db_path = self.in_db.text().strip()
         candidate.output_dir = self.in_output.text().strip()
         candidate.certstream_url = self.in_certstream.text().strip()
+        candidate.onion_index_url = self.in_onion_index.text().strip()
+        candidate.tor_proxy = self.in_tor_proxy.text().strip()
         candidate.seed_file = self.in_seed.text().strip() or None
         chosen = [name for name, box in self.source_checks.items() if box.isChecked()]
         if candidate.seed_file:
@@ -668,8 +896,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid settings", str(exc))
             return
 
+        database_changed = candidate.db_path != self.config.db_path
         self.config = candidate
         self.collector.update_config(candidate)
+        if database_changed:
+            self.open_database.emit(candidate.db_path)
+            self.reload_stored()
+            self.request_facets.emit()
+            self.request_summary.emit()
         try:
             candidate.save(self.config_path)
             self.log(f"Settings saved to {self.config_path}", "GOOD")
@@ -686,6 +920,12 @@ class MainWindow(QMainWindow):
             self._refresh_stats()
             if self._state in ("running", "paused", "stopping") and not self.collector.running:
                 self._set_state("stopped")
+                self.reload_stored()
+                self.request_facets.emit()
+                self.request_summary.emit()
+            self._refresh_tick = getattr(self, "_refresh_tick", 0) + 1
+            if self._state == "running" and self._refresh_tick % 40 == 0:
+                self.request_summary.emit()
         except Exception as exc:  # pragma: no cover - the UI must never die
             self.log(f"UI error: {type(exc).__name__}: {exc}", "ERROR")
 
@@ -759,16 +999,12 @@ class MainWindow(QMainWindow):
             scrollbar.setValue(scrollbar.maximum())
 
     # ---------------------------------------------------------------- filter
-    def _apply_domain_filter(self) -> None:
-        self.domain_proxy.set_needle(self.domain_search.text())
-        self.domain_proxy.set_live_only(self.only_live.isChecked())
-
     def _apply_tech_filter(self) -> None:
         self.tech_proxy.set_needle(self.tech_search.text())
 
     # -------------------------------------------------------------- geometry
     def _restore_geometry(self) -> None:
-        settings = QSettings("DomainCollector", "DomainCollector")
+        settings = QSettings("DomainAtlas", "DomainAtlas")
         geometry = settings.value("geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -776,7 +1012,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.collector.running:
             answer = QMessageBox.question(
-                self, "Quit Domain Collector",
+                self, "Quit Domain Atlas",
                 "Collection is still running. Stop it and quit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
@@ -784,10 +1020,24 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self.collector.stop(timeout=25)
-        settings = QSettings("DomainCollector", "DomainCollector")
+        settings = QSettings("DomainAtlas", "DomainAtlas")
         settings.setValue("geometry", self.saveGeometry())
         settings.setValue("theme", self.theme_name)
         self.timer.stop()
         if self._tray is not None:
             self._tray.hide()
+        self.shutdown_browser()
         event.accept()
+
+    @Slot()
+    def shutdown_browser(self) -> None:
+        """Stop the query thread. Safe to call more than once."""
+        thread = getattr(self, "browser_thread", None)
+        if thread is None:
+            return
+        browser = getattr(self, "browser", None)
+        if browser is not None:
+            browser.close()
+        thread.quit()
+        thread.wait(5000)
+        self.browser_thread = None

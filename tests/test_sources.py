@@ -4,8 +4,8 @@ import zipfile
 
 import pytest
 
-from domaincollector.config import Config
-from domaincollector.sources import (
+from domainatlas.config import Config
+from domainatlas.sources import (
     CrtShSource,
     SeedFileSource,
     SourceError,

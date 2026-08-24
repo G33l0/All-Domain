@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 import pytest_asyncio
 
-from domaincollector.store import DomainRecord, DomainStore, safe_filename
+from domainatlas.store import DomainRecord, DomainStore, safe_filename
 
 pytestmark = pytest.mark.asyncio
 

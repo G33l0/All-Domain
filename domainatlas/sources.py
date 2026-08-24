@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import csv
+import logging
 import io
 import json
 import os
@@ -29,7 +30,15 @@ import aiohttp
 from .domains import normalize_all, normalize_domain
 from .httputil import read_capped
 
-__all__ = ["Source", "SourceError", "SOURCE_NAMES", "build_sources", "available_sources"]
+__all__ = [
+    "Source",
+    "SourceError",
+    "SOURCE_CLASSES",
+    "available_sources",
+    "build_sources",
+    "load_plugin_sources",
+    "register_source",
+]
 
 
 class SourceError(RuntimeError):
@@ -451,6 +460,39 @@ def _parse_certstream(payload: str) -> List[str]:
     return names
 
 
+class OnionIndexSource(Source):
+    """Tor hidden services listed by a public clearnet index.
+
+    Addresses are collected over the clear web, so this source works without
+    Tor. Probing the services themselves needs ``tor_proxy`` configured.
+    """
+
+    name = "onion"
+    slow = True
+    MAX_BYTES = 16 * 1024 * 1024
+    ONION_RE = re.compile(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b", re.IGNORECASE)
+
+    def __init__(self, url: str = "https://ahmia.fi/onions/", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.url = url
+
+    async def fetch(self, session: "aiohttp.ClientSession", limit: int) -> List[str]:
+        payload = await _get(
+            session, self.url, timeout=max(self.timeout, 60.0),
+            max_bytes=self.MAX_BYTES, retries=self.retries,
+        )
+        text = payload.decode("utf-8", errors="ignore")
+        addresses = [f"{match.group(0).lower()}" for match in self.ONION_RE.finditer(text)]
+        if not addresses:
+            raise SourceError(f"{self.url} listed no .onion addresses")
+        unique = normalize_all(addresses)
+        offset = self._next_offset(limit, len(unique))
+        window = unique[offset:offset + limit]
+        if len(window) < limit:
+            window += unique[: limit - len(window)]
+        return window
+
+
 class SeedFileSource(Source):
     """Read candidate domains from a local file (one per line)."""
 
@@ -482,17 +524,75 @@ SOURCE_CLASSES: Dict[str, type] = {
     TrancoSource.name: TrancoSource,
     UmbrellaSource.name: UmbrellaSource,
     MajesticSource.name: MajesticSource,
+    OnionIndexSource.name: OnionIndexSource,
 }
 
-SOURCE_NAMES: Sequence[str] = tuple(SOURCE_CLASSES) + ("file",)
+#: The seed-file source is built from a path rather than a bare name.
+BUILTIN_EXTRA = ("file",)
+
+#: Names known at import time. Call :func:`available_sources` for the live list
+#: once plugins have been discovered.
+SOURCE_NAMES: Sequence[str] = tuple(SOURCE_CLASSES) + BUILTIN_EXTRA
+
+_plugins_loaded = False
+
+
+def register_source(source_class: type) -> type:
+    """Register a :class:`Source` subclass under its ``name``.
+
+    Usable as a decorator, and the hook third-party packages call to add feeds
+    without modifying this module.
+    """
+    if not isinstance(source_class, type) or not issubclass(source_class, Source):
+        raise TypeError(f"{source_class!r} is not a Source subclass")
+    name = getattr(source_class, "name", "")
+    if not name or name in BUILTIN_EXTRA:
+        raise ValueError("a source needs a unique, non-empty name")
+    SOURCE_CLASSES[name] = source_class
+    return source_class
+
+
+def load_plugin_sources() -> List[str]:
+    """Import sources advertised on the ``domain_atlas.sources`` entry point.
+
+    Returns the names that were added. Import failures are reported but never
+    stop the application from starting.
+    """
+    global _plugins_loaded
+    if _plugins_loaded:
+        return []
+    _plugins_loaded = True
+
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:
+        return []
+
+    added: List[str] = []
+    try:
+        found = entry_points(group="domain_atlas.sources")
+    except TypeError:
+        found = entry_points().get("domain_atlas.sources", [])
+    for entry in found:
+        try:
+            candidate = entry.load()
+            register_source(candidate)
+            added.append(candidate.name)
+        except Exception as exc:
+            logging.getLogger("domain-atlas").warning(
+                "could not load source plugin %s: %s", getattr(entry, "name", entry), exc
+            )
+    return added
 
 
 def available_sources() -> Sequence[str]:
-    return SOURCE_NAMES
+    load_plugin_sources()
+    return tuple(SOURCE_CLASSES) + BUILTIN_EXTRA
 
 
 def build_sources(config) -> List[Source]:
-    """Instantiate the sources named in *config*.  Raises ``ValueError`` on typos."""
+    """Instantiate the sources named in *config*. Raises ``ValueError`` on typos."""
+    load_plugin_sources()
     sources: List[Source] = []
     kwargs = dict(user_agent=config.user_agent, cache_dir=config.cache_dir, retries=config.source_retries)
     for name in config.sources:
@@ -503,7 +603,12 @@ def build_sources(config) -> List[Source]:
             continue
         cls = SOURCE_CLASSES.get(name)
         if cls is None:
-            raise ValueError(f"unknown source {name!r}; valid sources: {', '.join(SOURCE_NAMES)}")
+            raise ValueError(
+                f"unknown source {name!r}; valid sources: {', '.join(available_sources())}"
+            )
+        if cls is OnionIndexSource:
+            sources.append(OnionIndexSource(url=config.onion_index_url, **kwargs))
+            continue
         if cls is CertStreamSource:
             sources.append(
                 CertStreamSource(

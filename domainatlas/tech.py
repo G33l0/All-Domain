@@ -1,19 +1,16 @@
 """Technology fingerprinting.
 
-The 1.x collector delegated to the ``builtwith`` package.  That package has
-been unmaintained since 2015, no longer builds on modern setuptools, performs
-*blocking* network I/O, and was called with the wrong signature.  This module
-replaces it with a small, dependency-free rule engine that inspects the
-response headers, cookies and HTML body that the collector already has in
-hand, so no extra request is ever made.
+A dependency-free rule engine over the response headers, cookies, meta tags and
+HTML already fetched by the collector, so detection costs no extra requests.
 
-``builtwith`` can still be used when it happens to be installed (see
-``Config.use_builtwith``); it is then executed in a worker thread with the
-headers and HTML supplied, which keeps it off the event loop.
+The legacy ``builtwith`` package can be used alongside it when installed (see
+``Config.use_builtwith``); it runs in a worker thread with the headers and HTML
+supplied so it never performs its own blocking request.
 """
 
 from __future__ import annotations
 
+import importlib
 import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Optional, Pattern, Tuple
@@ -256,7 +253,7 @@ def categories_for(technology: str) -> str:
 # ------------------------------------------------------------------ builtwith
 def builtwith_available() -> bool:
     try:  # pragma: no cover - depends on the environment
-        import builtwith  # noqa: F401
+        importlib.import_module("builtwith")
     except Exception:
         return False
     return True

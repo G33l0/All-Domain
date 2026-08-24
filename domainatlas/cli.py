@@ -17,21 +17,33 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
+from .export import FORMATS as EXPORT_FORMATS
+from .export import ExportError, export_to_path, format_for_path
+from .query import DomainFilter, DomainQuery, QueryError
 from .engine import Collector, Event
-from .sources import SOURCE_NAMES
-from .store import DomainStore
+from .sources import available_sources
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 DATE_FORMAT = "%H:%M:%S"
 
 
+def _theme_names() -> Sequence[str]:
+    """Theme keys, resolved lazily so the CLI works without PySide6 installed."""
+    try:
+        from .qtui.theme import theme_names
+
+        return theme_names()
+    except Exception:
+        return ("light", "dark", "midnight", "aurora", "amber", "hacker")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="domain_collector",
+        prog="domain_atlas",
         description="Discover live domains and fingerprint the technologies they run on.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"domain-collector {__version__}")
+    parser.add_argument("--version", action="version", version=f"domain-atlas {__version__}")
     parser.add_argument("-c", "--config", default=DEFAULT_CONFIG_PATH, help="path to the JSON config file")
     parser.add_argument("--headless", "--no-gui", dest="headless", action="store_true",
                         help="run in the terminal instead of opening the desktop app")
@@ -39,8 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ui", choices=["auto", "qt", "tk"], default="auto",
                         help="which desktop interface to use: the modern Qt/PySide6 app, "
                              "the built-in Tk fallback, or whichever is available")
-    parser.add_argument("--theme", choices=["system", "light", "dark"], default=None,
-                        help="Qt interface colour theme (default: follow the OS)")
+    parser.add_argument("--theme", default=None, metavar="NAME",
+                        help="desktop theme: system, " + ", ".join(_theme_names()))
     parser.add_argument("--once", action="store_true", help="run a single fetch cycle, then exit")
     parser.add_argument("--cycles", type=int, default=None, metavar="N", help="stop after N fetch cycles")
     parser.add_argument("--concurrency", type=int, default=None, help="number of concurrent probes")
@@ -53,12 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=None, dest="db_path", help="SQLite database path")
     parser.add_argument("--output", default=None, dest="output_dir", help="directory for technology files")
     parser.add_argument("--sources", default=None,
-                        help=f"comma separated feed list ({', '.join(SOURCE_NAMES)})")
+                        help=f"comma separated feed list ({', '.join(available_sources())})")
     parser.add_argument("--seed-file", default=None, dest="seed_file",
                         help="file with candidate domains, one per line")
     parser.add_argument("--certstream-url", default=None, dest="certstream_url",
                         help="certstream websocket URL (use your own certstream-server "
                              "instance; the public one is often idle)")
+    parser.add_argument("--tor-proxy", default=None, dest="tor_proxy", metavar="URL",
+                        help="SOCKS5 proxy used to probe .onion domains, "
+                             "e.g. socks5://127.0.0.1:9050")
+    parser.add_argument("--onion-index-url", default=None, dest="onion_index_url",
+                        metavar="URL", help="public index used by the onion source")
     parser.add_argument("--recheck-after", type=int, default=None, dest="recheck_after",
                         metavar="SECONDS",
                         help="re-probe stored domains older than this (0 disables re-checking)")
@@ -77,15 +94,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-config", action="store_true",
                         help="write the resulting settings back to the config file and exit")
     parser.add_argument("--stats", action="store_true", help="print database statistics and exit")
-    parser.add_argument("--export", metavar="TECHNOLOGY",
-                        help="print the stored domains for a technology and exit")
+
+    export_group = parser.add_argument_group("export")
+    export_group.add_argument(
+        "--export", metavar="PATH",
+        help="export stored domains and exit; use - for standard output")
+    export_group.add_argument(
+        "--export-format", choices=list(EXPORT_FORMATS), default=None,
+        help="export format (default: inferred from the file extension, else csv)")
+    export_group.add_argument("--filter-technology", metavar="NAME",
+                              help="only domains running this technology")
+    export_group.add_argument("--filter-source", metavar="NAME",
+                              help="only domains discovered by this source")
+    export_group.add_argument("--filter-contains", metavar="TEXT",
+                              help="only domains whose name contains this text")
+    export_group.add_argument("--filter-since", metavar="TIMESTAMP",
+                              help="only domains first seen or checked at or after this "
+                                   "timestamp, e.g. 2026-01-31 or '2026-01-31 12:00:00'")
+    export_group.add_argument("--filter-live", action="store_true",
+                              help="only domains that answered")
+    export_group.add_argument("--filter-down", action="store_true",
+                              help="only domains that did not answer")
+    export_group.add_argument("--filter-onion", action="store_true",
+                              help="only .onion domains")
+    export_group.add_argument("--filter-clearnet", action="store_true",
+                              help="exclude .onion domains")
     return parser
+
+
+def filter_from_args(args: argparse.Namespace) -> DomainFilter:
+    """Build a query filter from the --filter-* options."""
+    responsive: Optional[bool] = None
+    if args.filter_live and args.filter_down:
+        raise ValueError("--filter-live and --filter-down are mutually exclusive")
+    if args.filter_live:
+        responsive = True
+    elif args.filter_down:
+        responsive = False
+
+    onion: Optional[bool] = None
+    if args.filter_onion and args.filter_clearnet:
+        raise ValueError("--filter-onion and --filter-clearnet are mutually exclusive")
+    if args.filter_onion:
+        onion = True
+    elif args.filter_clearnet:
+        onion = False
+
+    return DomainFilter(
+        text=args.filter_contains or "",
+        technology=args.filter_technology,
+        source=args.filter_source,
+        responsive=responsive,
+        since=args.filter_since,
+        onion=onion,
+    )
 
 
 def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
     for field_name in ("concurrency", "http_timeout", "fetch_interval", "max_domains_per_cycle",
                        "db_path", "output_dir", "seed_file", "log_level",
-                       "certstream_url", "recheck_after", "recheck_batch"):
+                       "certstream_url", "recheck_after", "recheck_batch",
+                       "tor_proxy", "onion_index_url"):
         value = getattr(args, field_name, None)
         if value is not None:
             setattr(config, field_name, value)
@@ -107,7 +176,7 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
 def _make_logger(level: str) -> logging.Logger:
     logging.basicConfig(level=getattr(logging, level, logging.INFO),
                         format=LOG_FORMAT, datefmt=DATE_FORMAT, stream=sys.stdout)
-    return logging.getLogger("domain-collector")
+    return logging.getLogger("domain-atlas")
 
 
 async def run_headless(config: Config, cycles: Optional[int]) -> int:
@@ -153,44 +222,50 @@ async def run_headless(config: Config, cycles: Optional[int]) -> int:
     return 0
 
 
-async def run_stats(config: Config) -> int:
-    store = DomainStore(config.db_path, config.output_dir, write_tech_files=False)
+def run_stats(config: Config) -> int:
     if not os.path.exists(config.db_path):
         print(f"No database at {config.db_path} yet.")
         return 1
-    await store.open()
     try:
-        summary = await store.summary()
-        print(f"Database        : {config.db_path}")
-        print(f"Domains stored  : {summary['total']}")
-        print(f"Responsive      : {summary['responsive']}")
-        print(f"Technologies    : {summary['technologies']}")
-        top = await store.top_technologies(20)
-        if top:
-            print("\nTop technologies")
-            width = max(len(name) for name, _ in top)
-            for name, count in top:
-                print(f"  {name.ljust(width)}  {count}")
-    finally:
-        await store.close()
+        with DomainQuery(config.db_path) as query:
+            summary = query.summary()
+            print(f"Database      : {config.db_path}")
+            print(f"Domains       : {summary['total']:,}")
+            print(f"Responsive    : {summary['responsive']:,}")
+            print(f"Technologies  : {summary['technologies']:,}")
+            print(f"Tor (.onion)  : {summary['onion']:,}")
+            sources = query.sources()
+            if sources:
+                print(f"Sources       : {', '.join(sources)}")
+            top = query.technologies(20)
+            if top:
+                width = max(len(name) for name, _ in top)
+                print("\nTop technologies")
+                for name, count in top:
+                    print(f"  {name.ljust(width)}  {count:>9,}")
+    except QueryError as exc:
+        print(f"Cannot read the database: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
-async def run_export(config: Config, technology: str) -> int:
+def run_export(config: Config, destination: str, criteria: DomainFilter,
+               export_format: Optional[str]) -> int:
     if not os.path.exists(config.db_path):
         print(f"No database at {config.db_path} yet.", file=sys.stderr)
         return 1
-    store = DomainStore(config.db_path, config.output_dir, write_tech_files=False)
-    await store.open()
+    if export_format is None:
+        export_format = "txt" if destination == "-" else format_for_path(destination)
     try:
-        domains = await store.domains_for_technology(technology, limit=1_000_000)
-        for domain in domains:
-            print(domain)
-        if not domains:
-            print(f"No domains stored for technology {technology!r}.", file=sys.stderr)
-            return 1
-    finally:
-        await store.close()
+        written = export_to_path(config.db_path, destination, criteria, export_format)
+    except (ExportError, QueryError) as exc:
+        print(f"Export failed: {exc}", file=sys.stderr)
+        return 1
+    if destination != "-":
+        print(f"Exported {written:,} domains to {destination} ({export_format})")
+    if not written:
+        print("No domains matched the filter.", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -254,6 +329,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error(str(exc))
         return 2  # pragma: no cover - argparse exits
 
+    if args.theme is not None:
+        valid = ("system",) + tuple(_theme_names())
+        if args.theme not in valid:
+            parser.error(f"--theme must be one of: {', '.join(valid)}")
+
     if args.save_config:
         try:
             config.save(args.config)
@@ -263,10 +343,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Configuration written to {args.config}")
         return 0
 
+    try:
+        criteria = filter_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2  # pragma: no cover - argparse exits
+
     if args.stats:
-        return asyncio.run(run_stats(config))
+        return run_stats(config)
     if args.export:
-        return asyncio.run(run_export(config, args.export))
+        return run_export(config, args.export, criteria, args.export_format)
 
     cycles = 1 if args.once else args.cycles
     if cycles is not None and cycles < 1:

@@ -1,4 +1,4 @@
-"""Configuration handling for Domain Collector.
+"""Configuration handling for Domain Atlas.
 
 The configuration is a plain dataclass that can be loaded from / saved to a
 JSON file.  Every value is validated and clamped to a sane range so a bad
@@ -16,7 +16,7 @@ DEFAULT_CONFIG_PATH = "config.json"
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 domain-collector/2.0"
+    "Chrome/124.0 Safari/537.36 domain-atlas/2.0"
 )
 
 #: Public certstream server.  It is frequently idle - point this at your own
@@ -95,6 +95,12 @@ class Config:
     certstream_buffer: int = 20000
     #: Seconds a certstream fetch waits for the stream to produce something.
     certstream_wait: float = 15.0
+    #: SOCKS5 proxy used to reach .onion services, e.g. socks5://127.0.0.1:9050.
+    #: Empty means Tor is disabled: .onion domains are still discovered and
+    #: stored, but not probed.
+    tor_proxy: str = ""
+    #: Public index used by the "onion" source.
+    onion_index_url: str = "https://ahmia.fi/onions/"
     db_path: str = "domains.db"
     output_dir: str = "output"
     cache_dir: str = ".cache"
@@ -128,6 +134,17 @@ class Config:
         self.certstream_wait = _as_float(
             "certstream_wait", self.certstream_wait, 1.0, 300.0, defaults.certstream_wait
         )
+        tor_proxy = str(self.tor_proxy or "").strip()
+        if tor_proxy and not tor_proxy.startswith(("socks5://", "socks5h://", "socks4://")):
+            raise ConfigError(
+                f"tor_proxy must be a socks5:// URL, got {tor_proxy!r}"
+            )
+        self.tor_proxy = tor_proxy
+        onion_index = str(self.onion_index_url or "").strip() or defaults.onion_index_url
+        if not onion_index.startswith(("http://", "https://")):
+            raise ConfigError(f"onion_index_url must be an http(s) URL, got {onion_index!r}")
+        self.onion_index_url = onion_index
+
         certstream_url = str(self.certstream_url or "").strip() or defaults.certstream_url
         if not certstream_url.startswith(("ws://", "wss://")):
             raise ConfigError(f"certstream_url must start with ws:// or wss://, got {certstream_url!r}")

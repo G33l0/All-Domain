@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from domaincollector.cli import apply_overrides, build_parser, main
-from domaincollector.config import Config
+from domainatlas.cli import apply_overrides, build_parser, main
+from domainatlas.config import Config
 
 
 def test_defaults_parse():
@@ -54,7 +54,7 @@ def test_version(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["--version"])
     assert excinfo.value.code == 0
-    assert "domain-collector" in capsys.readouterr().out
+    assert "domain-atlas" in capsys.readouterr().out
 
 
 def test_recheck_and_certstream_overrides():
@@ -86,3 +86,59 @@ def test_recheck_only_is_accepted_with_an_interval():
     config = apply_overrides(Config(), args)
     assert config.recheck_only is True
     assert config.recheck_after == 3600
+
+
+def test_tor_and_onion_overrides():
+    args = build_parser().parse_args(
+        ["--tor-proxy", "socks5://127.0.0.1:9050",
+         "--onion-index-url", "https://example.org/onions"]
+    )
+    config = apply_overrides(Config(), args)
+    assert config.tor_proxy == "socks5://127.0.0.1:9050"
+    assert config.onion_index_url == "https://example.org/onions"
+
+
+def test_tor_proxy_must_be_socks(capsys):
+    with pytest.raises(SystemExit):
+        main(["--tor-proxy", "http://proxy.example"])
+    assert "socks5" in capsys.readouterr().err
+
+
+def test_export_filters_build_a_query_filter():
+    from domainatlas.cli import filter_from_args
+
+    args = build_parser().parse_args(
+        ["--export", "-", "--filter-technology", "Nginx", "--filter-source", "crtsh",
+         "--filter-contains", "shop", "--filter-since", "2026-01-01", "--filter-live",
+         "--filter-onion"]
+    )
+    criteria = filter_from_args(args)
+    assert criteria.technology == "Nginx"
+    assert criteria.source == "crtsh"
+    assert criteria.text == "shop"
+    assert criteria.since == "2026-01-01"
+    assert criteria.responsive is True
+    assert criteria.onion is True
+
+
+def test_conflicting_export_filters_are_rejected():
+    from domainatlas.cli import filter_from_args
+
+    args = build_parser().parse_args(["--filter-live", "--filter-down"])
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        filter_from_args(args)
+
+    args = build_parser().parse_args(["--filter-onion", "--filter-clearnet"])
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        filter_from_args(args)
+
+
+def test_export_without_a_database_reports_cleanly(workdir, capsys):
+    assert main(["--export", "out.csv", "--db", "missing.db"]) == 1
+    assert "No database" in capsys.readouterr().err
+
+
+def test_theme_names_are_validated(capsys):
+    with pytest.raises(SystemExit):
+        main(["--theme", "chartreuse"])
+    assert "--theme must be one of" in capsys.readouterr().err

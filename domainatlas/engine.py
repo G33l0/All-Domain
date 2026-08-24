@@ -1,15 +1,9 @@
-"""The asynchronous collection engine.
+"""Asynchronous collection engine.
 
-Responsibilities
-----------------
-* one producer that pulls candidate domains from the configured sources, with
-  per-source failure tracking and cooldowns;
-* N consumers that probe each domain over HTTPS then HTTP and fingerprint the
-  response;
-* a stats object and an event stream that any front-end (GUI or CLI) can
-  consume without touching engine internals;
-* deterministic, graceful shutdown - every task cancelled, every session and
-  the database closed, every buffered write flushed.
+A producer pulls candidates from the configured sources, tracking per-source
+failures and cooldowns. Consumers probe each domain over HTTPS then HTTP and
+fingerprint the response. Progress is published as events for any front-end to
+consume. Shutdown cancels every task and closes every session and the database.
 """
 
 from __future__ import annotations
@@ -26,7 +20,7 @@ import aiohttp
 
 from . import tech as tech_module
 from .config import Config
-from .domains import normalize_domain
+from .domains import is_onion, normalize_domain
 from .httputil import read_capped
 from .sources import Source, SourceError, build_sources
 from .store import DomainRecord, DomainStore
@@ -97,6 +91,31 @@ class ProbeResult:
     versions: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
     elapsed_ms: int = 0
+
+
+class TorUnavailable(RuntimeError):
+    """Tor was requested but cannot be used; the message says why."""
+
+
+def tor_connector(config: Config):
+    """A SOCKS connector for reaching .onion services.
+
+    Raises :class:`TorUnavailable` with a specific reason rather than failing
+    silently: without it, .onion domains are still discovered and stored, they
+    are simply not probed. Must be called from inside a running event loop.
+    """
+    if not config.tor_proxy:
+        raise TorUnavailable("no tor_proxy configured")
+    try:
+        from aiohttp_socks import ProxyConnector
+    except ImportError as exc:
+        raise TorUnavailable(
+            "aiohttp-socks is not installed (pip install aiohttp-socks)"
+        ) from exc
+    try:
+        return ProxyConnector.from_url(config.tor_proxy, limit=max(4, config.concurrency))
+    except Exception as exc:
+        raise TorUnavailable(f"{config.tor_proxy}: {type(exc).__name__}: {exc}") from exc
 
 
 def _ssl_argument(config: Config):
@@ -231,6 +250,7 @@ class Collector:
         self._pause_requested = False
         self._tasks: List[asyncio.Task] = []
         self._cooldowns: Dict[str, float] = {}
+        self._tor_session: Optional["aiohttp.ClientSession"] = None
         #: Domains queued for a re-check; they are already in the store, so
         #: store.reserve() cannot be used to keep them out of the queue twice.
         self._rechecking: set = set()
@@ -286,7 +306,7 @@ class Collector:
         try:
             self._on_event(event)
         except Exception:
-            # A broken front-end must never take the collector down.
+            # A front-end error must not stop collection.
             pass
 
     def _log(self, message: str, level: str = "INFO", **data: Any) -> None:
@@ -329,6 +349,23 @@ class Collector:
                    if self.config.recheck_after else "")
             )
 
+        tor_session: Optional[aiohttp.ClientSession] = None
+        if self.config.tor_proxy:
+            try:
+                tor_session = aiohttp.ClientSession(
+                    headers={"User-Agent": self.config.user_agent},
+                    connector=tor_connector(self.config),
+                    timeout=aiohttp.ClientTimeout(total=max(30.0, self.config.http_timeout)),
+                )
+                self._log(f"Tor enabled for .onion domains via {self.config.tor_proxy}")
+            except TorUnavailable as exc:
+                self._log(
+                    f"Tor unavailable ({exc}); .onion domains will be stored "
+                    "but not probed",
+                    "WARN",
+                )
+        self._tor_session = tor_session
+
         producer = asyncio.create_task(self._producer(session, cycles), name="producer")
         consumers = [
             asyncio.create_task(self._consumer(session, index), name=f"consumer-{index}")
@@ -360,6 +397,9 @@ class Collector:
                 else:
                     await self.store.flush()
             finally:
+                if tor_session is not None:
+                    await tor_session.close()
+                self._tor_session = None
                 await session.close()
                 await connector.close()
                 # let aiohttp close its transports before the loop goes away
@@ -412,12 +452,17 @@ class Collector:
             self._log(f"All sources cooling down, retrying in {max(1, int(soonest))}s", "WARN")
             return queued
 
-        for source in usable:
+        # Each source gets an equal share of the cycle budget. Serving them in
+        # order until the budget ran out let the first source starve the rest.
+        share = max(1, (wanted - queued) // len(usable))
+        for index, source in enumerate(usable):
             if self._stop.is_set() or queued >= wanted:
                 break
             remaining = wanted - queued
+            # The last source may use whatever the others left unclaimed.
+            allowance = remaining if index == len(usable) - 1 else min(share, remaining)
             try:
-                candidates = await source.fetch(session, remaining)
+                candidates = await source.fetch(session, allowance)
                 self.stats.source_ok[source.name] += 1
                 self._cooldowns.pop(source.name, None)
             except asyncio.CancelledError:
@@ -518,7 +563,19 @@ class Collector:
             except asyncio.CancelledError:
                 break
             try:
-                result = await probe_domain(session, fingerprint, self.config, ssl_arg)
+                if is_onion(fingerprint):
+                    if self._tor_session is None:
+                        result = ProbeResult(
+                            responsive=False,
+                            reached=False,
+                            error="not probed: no Tor proxy configured",
+                        )
+                    else:
+                        result = await probe_domain(
+                            self._tor_session, fingerprint, self.config, None
+                        )
+                else:
+                    result = await probe_domain(session, fingerprint, self.config, ssl_arg)
                 if not result.responsive and not self.config.store_unresponsive and not is_recheck:
                     self.store.release(fingerprint)
                 else:

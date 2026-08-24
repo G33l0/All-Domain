@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "domain-collector"
-version = "2.0.0"
-description = "Asynchronous domain discovery and technology fingerprinting"
+name = "domain-atlas"
+version = "3.0.0"
+description = "Asynchronous domain discovery, technology fingerprinting and inventory"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -28,22 +28,23 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.5"]
+tor = ["aiohttp-socks>=0.8"]
 dev = ["pytest>=7", "pytest-asyncio>=0.21", "PySide6>=6.5"]
 build = ["pyinstaller>=6.0"]
 
 [project.scripts]
-domain-collector = "domaincollector.cli:main"
+domain-atlas = "domainatlas.cli:main"
 
 # gui-scripts produces a launcher with no console window on Windows.
 [project.gui-scripts]
-domain-collector-gui = "domaincollector.cli:main"
+domain-atlas-gui = "domainatlas.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/G33l0/All-Domain"
 
 [tool.setuptools]
-packages = ["domaincollector", "domaincollector.qtui"]
-py-modules = ["domain_collector"]
+packages = ["domainatlas", "domainatlas.qtui"]
+py-modules = ["domain_atlas"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

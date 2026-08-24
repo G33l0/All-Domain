@@ -36,11 +36,11 @@ _SHAPES = {"check": _CHECK, "chevron-down": _CHEVRON_DOWN, "chevron-up": _CHEVRO
 
 def _asset_dir() -> str:
     base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
-    directory = os.path.join(base or tempfile.gettempdir(), "domain-collector-assets")
+    directory = os.path.join(base or tempfile.gettempdir(), "domain-atlas-assets")
     try:
         os.makedirs(directory, exist_ok=True)
     except OSError:  # pragma: no cover - read-only home
-        directory = os.path.join(tempfile.gettempdir(), "domain-collector-assets")
+        directory = os.path.join(tempfile.gettempdir(), "domain-atlas-assets")
         os.makedirs(directory, exist_ok=True)
     return directory
 

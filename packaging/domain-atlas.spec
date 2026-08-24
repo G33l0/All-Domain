@@ -1,9 +1,9 @@
 # PyInstaller spec - builds a single-file Windows executable.
 #
 #   pip install pyinstaller PySide6
-#   pyinstaller packaging/domain-collector.spec
+#   pyinstaller packaging/domain-atlas.spec
 #
-# The result is dist/DomainCollector.exe, which opens the Qt interface with no
+# The result is dist/DomainAtlas.exe, which opens the Qt interface with no
 # console window.  Run it with --headless from a terminal for the CLI.
 
 import os
@@ -13,14 +13,14 @@ block_cipher = None
 project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(SPEC)), ".."))
 
 a = Analysis(
-    [os.path.join(project_root, "domain_collector.py")],
+    [os.path.join(project_root, "domain_atlas.py")],
     pathex=[project_root],
     binaries=[],
     datas=[],
     hiddenimports=[
-        "domaincollector.qtui",
-        "domaincollector.qtui.mainwindow",
-        "domaincollector.gui",
+        "domainatlas.qtui",
+        "domainatlas.qtui.mainwindow",
+        "domainatlas.gui",
         "aiosqlite",
     ],
     hookspath=[],
@@ -43,7 +43,7 @@ exe = EXE(
     a.binaries,
     a.zipfiles,
     a.datas,
-    name="DomainCollector",
+    name="DomainAtlas",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -57,5 +57,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon=os.path.join(project_root, "assets", "domain-atlas.ico"),
 )

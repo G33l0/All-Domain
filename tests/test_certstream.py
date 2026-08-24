@@ -8,8 +8,8 @@ import pytest
 import pytest_asyncio
 from aiohttp import web
 
-from domaincollector.config import Config
-from domaincollector.sources import CertStreamSource, SourceError, _parse_certstream, build_sources
+from domainatlas.config import Config
+from domainatlas.sources import CertStreamSource, SourceError, _parse_certstream, build_sources
 
 FULL_MESSAGE = json.dumps(
     {

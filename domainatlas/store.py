@@ -1,14 +1,9 @@
-"""Persistence layer: SQLite database plus per-technology text files.
+"""Persistence: SQLite database plus per-technology text files.
 
-Design notes
-------------
-* One long-lived ``aiosqlite`` connection is used instead of opening a new
-  connection per domain (the 1.x behaviour), which was both slow and a source
-  of ``database is locked`` errors under concurrency.
-* WAL journalling and a busy timeout make concurrent readers safe.
-* Writes are batched by a background task and flushed with ``executemany``.
-* ``reserve()`` claims a fingerprint in memory before it is queued so the same
-  domain can never be probed twice by two workers.
+A single long-lived connection runs in WAL mode with a busy timeout, so readers
+never block the writer. Writes are batched by a background task and flushed
+with ``executemany``. ``reserve()`` claims a fingerprint before it is queued so
+no domain is probed twice.
 """
 
 from __future__ import annotations
@@ -179,8 +174,14 @@ class DomainStore:
                 tech_columns.add(row[1])
         if "version" not in tech_columns:
             await self._db.execute("ALTER TABLE domain_tech ADD COLUMN version TEXT")
-        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_domains_responsive ON domains(responsive)")
-        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_domain_tech_tech ON domain_tech(technology)")
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_domains_responsive ON domains(responsive)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_source ON domains(source)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_first_seen ON domains(first_seen, fingerprint)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_checked_at ON domains(checked_at)",
+            "CREATE INDEX IF NOT EXISTS idx_domain_tech_tech ON domain_tech(technology)",
+        ):
+            await self._db.execute(statement)
         await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         await self._db.commit()
 

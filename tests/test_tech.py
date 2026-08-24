@@ -1,6 +1,6 @@
 import re
 
-from domaincollector.tech import categories_for, detect, detect_versions
+from domainatlas.tech import categories_for, detect, detect_versions
 
 
 def test_detects_from_headers_with_version():

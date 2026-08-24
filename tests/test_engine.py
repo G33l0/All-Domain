@@ -6,10 +6,10 @@ import aiohttp
 import pytest_asyncio
 from aiohttp import web
 
-from domaincollector.config import Config
-from domaincollector.engine import Collector, probe_domain
-from domaincollector.sources import Source
-from domaincollector.store import DomainStore
+from domainatlas.config import Config
+from domainatlas.engine import Collector, probe_domain
+from domainatlas.sources import Source
+from domainatlas.store import DomainStore
 
 HTML = (
     '<html><head><meta name="generator" content="WordPress 6.4.2">'
@@ -114,7 +114,7 @@ class FailingSource(Source):
         self.calls = 0
 
     async def fetch(self, session, limit):
-        from domaincollector.sources import SourceError
+        from domainatlas.sources import SourceError
 
         self.calls += 1
         raise SourceError("feed is down")
@@ -136,7 +136,7 @@ async def test_full_cycle_persists_results(tmp_path, server):
     async def patched(session, domain, cfg, ssl_arg=None):
         return await original_probe(session, server, cfg, ssl_arg)
 
-    import domaincollector.engine as engine_module
+    import domainatlas.engine as engine_module
 
     engine_module.probe_domain = patched
     try:
@@ -187,11 +187,11 @@ async def test_duplicates_are_never_queued_twice(tmp_path):
     collector = Collector(config, sources=[source])
 
     async def never_reachable(session, domain, cfg, ssl_arg=None):
-        from domaincollector.engine import ProbeResult
+        from domainatlas.engine import ProbeResult
 
         return ProbeResult(responsive=False, error="stubbed")
 
-    import domaincollector.engine as engine_module
+    import domainatlas.engine as engine_module
 
     original = engine_module.probe_domain
     engine_module.probe_domain = never_reachable
@@ -214,11 +214,11 @@ async def test_stop_shuts_everything_down(tmp_path):
     collector = Collector(config, sources=[source])
 
     async def stub(session, domain, cfg, ssl_arg=None):
-        from domaincollector.engine import ProbeResult
+        from domainatlas.engine import ProbeResult
 
         return ProbeResult(responsive=False, error="stubbed")
 
-    import domaincollector.engine as engine_module
+    import domainatlas.engine as engine_module
 
     original = engine_module.probe_domain
     engine_module.probe_domain = stub
@@ -249,7 +249,7 @@ async def test_pause_and_resume(tmp_path):
 
 
 async def _run_one_cycle(collector, probe):
-    import domaincollector.engine as engine_module
+    import domainatlas.engine as engine_module
 
     original = engine_module.probe_domain
     engine_module.probe_domain = probe
@@ -272,7 +272,7 @@ def _recheck_config(tmp_path, **overrides):
 async def test_stale_domains_are_requeued_and_updated(tmp_path):
     import sqlite3
 
-    from domaincollector.engine import ProbeResult
+    from domainatlas.engine import ProbeResult
 
     config = _recheck_config(tmp_path, recheck_after=3600, recheck_batch=10)
     source = StubSource(["site.example"], cache_dir=str(tmp_path))
@@ -313,7 +313,7 @@ async def test_stale_domains_are_requeued_and_updated(tmp_path):
 async def test_rechecking_is_off_by_default(tmp_path):
     import sqlite3
 
-    from domaincollector.engine import ProbeResult
+    from domainatlas.engine import ProbeResult
 
     config = _recheck_config(tmp_path)
     assert config.recheck_after == 0
@@ -334,7 +334,7 @@ async def test_rechecking_is_off_by_default(tmp_path):
 async def test_recheck_batch_limits_the_queue(tmp_path):
     import sqlite3
 
-    from domaincollector.engine import ProbeResult
+    from domainatlas.engine import ProbeResult
 
     config = _recheck_config(tmp_path, recheck_after=3600, recheck_batch=2)
 
@@ -367,3 +367,88 @@ async def test_sources_are_closed_on_shutdown(tmp_path):
     source = ClosableSource(cache_dir=str(tmp_path))
     await Collector(config, sources=[source]).run(cycles=1)
     assert source.closed is True
+
+
+async def test_onion_domains_are_stored_when_tor_is_not_configured(tmp_path):
+    """Hidden services must still be recorded, flagged as unprobed."""
+    from domainatlas.store import DomainStore
+
+    config = _recheck_config(tmp_path)
+    assert config.tor_proxy == ""
+    onion = "a" * 56 + ".onion"
+    source = StubSource([onion, "clear.example"], cache_dir=str(tmp_path))
+    collector = Collector(config, sources=[source])
+
+    from domainatlas.engine import ProbeResult
+
+    async def probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(responsive=True, reached=True, status_code=200, technologies=[])
+
+    stats = await _run_one_cycle(collector, probe)
+    assert stats.processed == 2
+
+    store = DomainStore(config.db_path, config.output_dir)
+    await store.open()
+    try:
+        from domainatlas.query import DomainFilter, DomainQuery
+
+        await store.flush()
+    finally:
+        await store.close()
+
+    with DomainQuery(config.db_path) as query:
+        rows = query.page(DomainFilter(onion=True), limit=10)
+        assert [row.fingerprint for row in rows] == [onion]
+        assert rows[0].responsive is False
+        assert "Tor proxy" in (rows[0].error or "")
+        assert query.count(DomainFilter(onion=False))[0] == 1
+
+
+async def test_tor_unavailable_is_reported_once(tmp_path):
+    from domainatlas.engine import TorUnavailable
+
+    config = _recheck_config(tmp_path)
+    config.tor_proxy = "socks5://127.0.0.1:9"
+    events = []
+    collector = Collector(config, on_event=events.append,
+                          sources=[StubSource([], cache_dir=str(tmp_path))])
+
+    import domainatlas.engine as engine_module
+
+    original = engine_module.tor_connector
+
+    def unavailable(cfg):
+        raise TorUnavailable("aiohttp-socks is not installed")
+
+    engine_module.tor_connector = unavailable
+    try:
+        await collector.run(cycles=1)
+    finally:
+        engine_module.tor_connector = original
+
+    messages = [event.message for event in events]
+    assert any("Tor unavailable" in message for message in messages)
+
+
+async def test_sources_share_the_cycle_budget(tmp_path):
+    """A productive source must not starve the others."""
+    from domainatlas.engine import ProbeResult
+
+    config = _recheck_config(tmp_path, max_domains_per_cycle=9)
+    first = StubSource([f"a{i}.example" for i in range(100)], cache_dir=str(tmp_path))
+    second = StubSource([f"b{i}.example" for i in range(100)], cache_dir=str(tmp_path))
+    third = StubSource([f"c{i}.example" for i in range(100)], cache_dir=str(tmp_path))
+    first.name, second.name, third.name = "first", "second", "third"
+
+    async def probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(responsive=True, reached=True, status_code=200, technologies=[])
+
+    collector = Collector(config, sources=[first, second, third])
+    stats = await _run_one_cycle(collector, probe)
+    assert stats.processed == 9
+
+    from domainatlas.query import DomainQuery
+
+    with DomainQuery(config.db_path) as query:
+        stored = {row.fingerprint[0] for row in query.page(limit=50)}
+    assert stored == {"a", "b", "c"}

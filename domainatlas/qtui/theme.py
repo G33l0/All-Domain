@@ -8,7 +8,7 @@ is styled from one generated stylesheet, so switching theme is a single call.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Tuple
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QGuiApplication, QPalette
@@ -16,9 +16,11 @@ from PySide6.QtGui import QColor, QGuiApplication, QPalette
 
 @dataclass(frozen=True)
 class Palette:
-    """Every colour the UI uses, named by role rather than by shade."""
+    """Colour, typography and geometry for one theme."""
 
     name: str
+    label: str
+    is_dark: bool
     window: str
     surface: str
     surface_alt: str
@@ -38,13 +40,29 @@ class Palette:
     info: str
     shadow: str
     selection: str
+    font: str = ""
+    mono: str = ""
+    radius: int = 6
+    card_radius: int = 8
 
     def as_dict(self) -> Dict[str, str]:
-        return {field: getattr(self, field) for field in self.__dataclass_fields__}
+        values = {field: getattr(self, field) for field in self.__dataclass_fields__}
+        values["font"] = self.font or UI_FONT_STACK
+        values["mono"] = self.mono or MONO_FONT_STACK
+        return values
+
+
+#: Windows ships Segoe UI Variable (11) / Segoe UI (10); the rest are fallbacks.
+UI_FONT_STACK = '"Segoe UI Variable Display", "Segoe UI", "Inter", "Noto Sans", sans-serif'
+MONO_FONT_STACK = '"Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace'
+
+MONO_FONT_STACK_LITERAL = MONO_FONT_STACK
 
 
 LIGHT = Palette(
     name="light",
+    label="Light",
+    is_dark=False,
     window="#f3f3f3",
     surface="#ffffff",
     surface_alt="#fafafa",
@@ -68,6 +86,8 @@ LIGHT = Palette(
 
 DARK = Palette(
     name="dark",
+    label="Dark",
+    is_dark=True,
     window="#202020",
     surface="#2b2b2b",
     surface_alt="#272727",
@@ -89,9 +109,130 @@ DARK = Palette(
     selection="#2d4d63",
 )
 
-#: Windows ships Segoe UI Variable (11) / Segoe UI (10); the rest are fallbacks.
-UI_FONT_STACK = '"Segoe UI Variable Display", "Segoe UI", "Inter", "Noto Sans", sans-serif'
-MONO_FONT_STACK = '"Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono", monospace'
+#: Deep navy with an azure accent.
+MIDNIGHT = Palette(
+    name="midnight",
+    label="Midnight",
+    is_dark=True,
+    window="#0d1117",
+    surface="#151b23",
+    surface_alt="#11171f",
+    surface_hover="#1c2530",
+    border="#232c38",
+    border_strong="#313d4d",
+    text="#e6edf3",
+    text_muted="#9aa8b8",
+    text_faint="#6b7a8d",
+    accent="#4b91f7",
+    accent_hover="#66a3f8",
+    accent_pressed="#3a7ad4",
+    accent_text="#04122a",
+    success="#3fb950",
+    warning="#d29922",
+    danger="#f85149",
+    info="#58a6ff",
+    shadow="rgba(0, 0, 0, 0.5)",
+    selection="#1f3a5f",
+)
+
+#: Violet accent on near-black slate.
+AURORA = Palette(
+    name="aurora",
+    label="Aurora",
+    is_dark=True,
+    window="#12101c",
+    surface="#1b1827",
+    surface_alt="#171422",
+    surface_hover="#241f33",
+    border="#2c2740",
+    border_strong="#3b3455",
+    text="#ede9fb",
+    text_muted="#b3a9d4",
+    text_faint="#8579ad",
+    accent="#a78bfa",
+    accent_hover="#bda4ff",
+    accent_pressed="#8b6ce0",
+    accent_text="#1a1030",
+    success="#4ade80",
+    warning="#fbbf24",
+    danger="#fb7185",
+    info="#c084fc",
+    shadow="rgba(0, 0, 0, 0.5)",
+    selection="#38305a",
+)
+
+#: Warm charcoal with an amber accent.
+AMBER = Palette(
+    name="amber",
+    label="Amber",
+    is_dark=True,
+    window="#17130e",
+    surface="#211b14",
+    surface_alt="#1c1710",
+    surface_hover="#2c241a",
+    border="#342a1e",
+    border_strong="#48392a",
+    text="#f5e9d7",
+    text_muted="#c7ae8c",
+    text_faint="#9a8465",
+    accent="#ffb020",
+    accent_hover="#ffc14d",
+    accent_pressed="#d99414",
+    accent_text="#2a1a00",
+    success="#9ecb5f",
+    warning="#ffd166",
+    danger="#ff6b57",
+    info="#ffc14d",
+    shadow="rgba(0, 0, 0, 0.5)",
+    selection="#4a3616",
+)
+
+#: Monospaced phosphor-green terminal theme.
+HACKER = Palette(
+    name="hacker",
+    label="Hacker",
+    is_dark=True,
+    window="#000000",
+    surface="#050a06",
+    surface_alt="#020602",
+    surface_hover="#0c1a0e",
+    border="#123d1a",
+    border_strong="#1c5c28",
+    text="#33ff66",
+    text_muted="#20c24a",
+    text_faint="#158a33",
+    accent="#00ff66",
+    accent_hover="#66ff99",
+    accent_pressed="#00cc52",
+    accent_text="#001a08",
+    success="#00ff66",
+    warning="#e8ff3a",
+    danger="#ff4b4b",
+    info="#00e5ff",
+    shadow="rgba(0, 255, 102, 0.16)",
+    selection="#0f3d1c",
+    font=MONO_FONT_STACK_LITERAL,
+    radius=2,
+    card_radius=2,
+)
+
+#: Every selectable theme, in the order they appear in the picker.
+THEMES: "Dict[str, Palette]" = {
+    palette.name: palette
+    for palette in (LIGHT, DARK, MIDNIGHT, AURORA, AMBER, HACKER)
+}
+
+
+def theme_names() -> List[str]:
+    """Theme keys accepted by :func:`palette_for` (excluding ``"system"``)."""
+    return list(THEMES)
+
+
+def theme_labels() -> List[Tuple[str, str]]:
+    """``[(key, label)]`` for building a picker."""
+    return [(key, palette.label) for key, palette in THEMES.items()]
+
+
 
 
 def system_is_dark() -> bool:
@@ -109,11 +250,10 @@ def system_is_dark() -> bool:
 
 
 def palette_for(theme: str) -> Palette:
-    """``"light"``, ``"dark"`` or ``"system"``."""
-    if theme == "dark":
-        return DARK
-    if theme == "light":
-        return LIGHT
+    """Look up a theme by key; ``"system"`` follows the OS light/dark setting."""
+    palette = THEMES.get((theme or "").strip().lower())
+    if palette is not None:
+        return palette
     return DARK if system_is_dark() else LIGHT
 
 
@@ -140,8 +280,7 @@ def stylesheet(palette: Palette) -> str:
     from .assets import write_assets
 
     colors = palette.as_dict()
-    colors["font"] = UI_FONT_STACK
-    colors["mono"] = MONO_FONT_STACK
+    colors["check_radius"] = max(1, palette.radius - 2)
     assets = write_assets(palette.name, palette.accent_text, palette.text_muted)
     # A missing asset degrades to "no glyph" rather than breaking the sheet.
     colors["check_icon"] = assets.get("check", "")
@@ -190,7 +329,7 @@ QLabel#sectionTitle {{
 QPushButton#navButton {{
     background: transparent;
     border: none;
-    border-radius: 6px;
+    border-radius: {radius}px;
     padding: 9px 12px;
     text-align: left;
     font-size: 13px;
@@ -210,12 +349,12 @@ QPushButton#navButton:checked {{
 QFrame#card {{
     background: {surface};
     border: 1px solid {border};
-    border-radius: 8px;
+    border-radius: {card_radius}px;
 }}
 QFrame#statCard {{
     background: {surface};
     border: 1px solid {border};
-    border-radius: 8px;
+    border-radius: {card_radius}px;
 }}
 QLabel#statValue {{
     font-size: 26px;
@@ -237,7 +376,7 @@ QLabel#statHint {{
 QPushButton {{
     background: {surface};
     border: 1px solid {border_strong};
-    border-radius: 6px;
+    border-radius: {radius}px;
     padding: 7px 16px;
     color: {text};
 }}
@@ -275,7 +414,7 @@ QLabel#statusPill {{
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background: {surface};
     border: 1px solid {border_strong};
-    border-radius: 6px;
+    border-radius: {radius}px;
     padding: 6px 10px;
     selection-background-color: {accent};
     selection-color: {accent_text};
@@ -290,7 +429,7 @@ QCheckBox {{ spacing: 8px; padding: 3px 0; }}
 QCheckBox::indicator {{
     width: 17px; height: 17px;
     border: 1px solid {border_strong};
-    border-radius: 4px;
+    border-radius: {check_radius}px;
     background: {surface};
 }}
 QCheckBox::indicator:checked {{
@@ -306,7 +445,7 @@ QSpinBox::up-button, QDoubleSpinBox::up-button {{
     subcontrol-position: top right;
     width: 20px;
     border: none;
-    border-top-right-radius: 6px;
+    border-top-right-radius: {radius}px;
     background: transparent;
 }}
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
@@ -314,7 +453,7 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {{
     subcontrol-position: bottom right;
     width: 20px;
     border: none;
-    border-bottom-right-radius: 6px;
+    border-bottom-right-radius: {radius}px;
     background: transparent;
 }}
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
@@ -339,7 +478,7 @@ QTableView {{
     background: {surface};
     alternate-background-color: {surface_alt};
     border: 1px solid {border};
-    border-radius: 8px;
+    border-radius: {card_radius}px;
     gridline-color: transparent;
     selection-background-color: {selection};
     selection-color: {text};
@@ -361,7 +500,7 @@ QTableCornerButton::section {{ background: {surface_alt}; border: none; }}
 QPlainTextEdit#log {{
     background: {surface_alt};
     border: 1px solid {border};
-    border-radius: 8px;
+    border-radius: {card_radius}px;
     font-family: {mono};
     font-size: 12px;
     padding: 8px;
@@ -406,7 +545,7 @@ QStatusBar {{ background: {surface_alt}; border-top: 1px solid {border}; color: 
 QStatusBar::item {{ border: none; }}
 QGroupBox {{
     border: 1px solid {border};
-    border-radius: 8px;
+    border-radius: {card_radius}px;
     background: {surface};
     margin-top: 14px;
     padding: 14px;

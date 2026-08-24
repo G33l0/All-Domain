@@ -14,12 +14,12 @@ pytest.importorskip("PySide6.QtWidgets", reason="PySide6 is not installed")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from domaincollector.config import Config  # noqa: E402
-from domaincollector.engine import Event, Stats  # noqa: E402
-from domaincollector.qtui import pyside_available  # noqa: E402
-from domaincollector.qtui.icons import _SVG, app_icon, icon_pixmap, make_icon  # noqa: E402
-from domaincollector.qtui.models import DomainTableModel, TechnologyTableModel  # noqa: E402
-from domaincollector.qtui.theme import DARK, LIGHT, palette_for, stylesheet  # noqa: E402
+from domainatlas.config import Config  # noqa: E402
+from domainatlas.engine import Event, Stats  # noqa: E402
+from domainatlas.qtui import pyside_available  # noqa: E402
+from domainatlas.qtui.icons import _SVG, app_icon, icon_pixmap, make_icon  # noqa: E402
+from domainatlas.qtui.models import DomainTableModel, TechnologyTableModel  # noqa: E402
+from domainatlas.qtui.theme import DARK, LIGHT, palette_for, stylesheet  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -31,7 +31,7 @@ def qapp():
 
 @pytest.fixture
 def window(qapp, tmp_path):
-    from domaincollector.qtui.mainwindow import MainWindow
+    from domainatlas.qtui.mainwindow import MainWindow
 
     config = Config(
         concurrency=2, fetch_interval=3600, db_path=str(tmp_path / "d.db"),
@@ -42,6 +42,7 @@ def window(qapp, tmp_path):
     yield win
     win.collector.stop(timeout=5)
     win.timer.stop()
+    win.shutdown_browser()
 
 
 # ------------------------------------------------------------------- basics
@@ -174,28 +175,38 @@ def test_rate_is_hidden_until_it_is_meaningful(window):
     assert "measuring" in window.status_right.text()
 
 
-def test_domain_filter_hides_rows(window):
+def test_current_filter_reflects_the_controls(window):
+    window.domain_search.setText("example")
+    window.filter_status.setCurrentIndex(1)      # Live only
+    window.filter_network.setCurrentIndex(2)     # Tor only
+    criteria = window.current_filter()
+    assert criteria.text == "example"
+    assert criteria.responsive is True
+    assert criteria.onion is True
+
+    window.filter_status.setCurrentIndex(2)      # Down only
+    window.filter_network.setCurrentIndex(1)     # Clear web
+    criteria = window.current_filter()
+    assert criteria.responsive is False
+    assert criteria.onion is False
+
+
+def test_filter_changes_are_debounced(window):
+    window.domain_search.setText("abc")
+    assert window._reload_timer.isActive()
+
+
+def test_session_proxy_filters_the_dashboard_feed(window):
     window._handle_events([
         _domain_event("alpha.example", technologies=("Nginx",)),
         _domain_event("beta.example", responsive=False, technologies=()),
     ])
     assert window.domain_proxy.rowCount() == 2
-    window.domain_search.setText("alpha")
+    window.domain_proxy.set_needle("alpha")
     assert window.domain_proxy.rowCount() == 1
-    assert window.domain_proxy.data(window.domain_proxy.index(0, 0)) == "alpha.example"
-
-    window.domain_search.setText("nginx")   # technologies are searched too
+    window.domain_proxy.set_needle("")
+    window.domain_proxy.set_live_only(True)
     assert window.domain_proxy.rowCount() == 1
-
-    window.domain_search.clear()
-    window.only_live.setChecked(True)
-    assert window.domain_proxy.rowCount() == 1
-
-    # A filter must survive new results arriving
-    window._handle_events([_domain_event("gamma.example")])
-    assert window.domain_proxy.rowCount() == 2
-    window.only_live.setChecked(False)
-    assert window.domain_proxy.rowCount() == 3
 
 
 def test_technology_filter_hides_rows(window):
@@ -229,7 +240,7 @@ def test_settings_round_trip_through_the_form(window, tmp_path):
 def test_invalid_settings_are_refused(window, monkeypatch, tmp_path):
     warnings = []
     monkeypatch.setattr(
-        "domaincollector.qtui.mainwindow.QMessageBox.warning",
+        "domainatlas.qtui.mainwindow.QMessageBox.warning",
         lambda *args, **kwargs: warnings.append(args[2] if len(args) > 2 else ""),
     )
     window.in_certstream.setText("http://not-a-websocket")

@@ -1,7 +1,7 @@
 """Tkinter front-end.
 
 Everything that touches a widget happens on the Tk main thread.  The engine
-runs in :class:`~domaincollector.runner.CollectorThread` and communicates only
+runs in :class:`~domainatlas.runner.CollectorThread` and communicates only
 through a queue that is drained by an ``after()`` timer.
 """
 
@@ -41,7 +41,7 @@ def tkinter_available() -> bool:
     return tk is not None
 
 
-class DomainCollectorApp:
+class DomainAtlasApp:
     """The main window."""
 
     def __init__(self, root, config: Config, config_path: str = DEFAULT_CONFIG_PATH) -> None:
@@ -54,7 +54,7 @@ class DomainCollectorApp:
         self._log_lines = 0
         self._state = "stopped"
 
-        root.title("Domain Collector 2.0")
+        root.title("Domain Atlas 2.0")
         root.geometry("1050x720")
         root.minsize(820, 560)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -175,7 +175,7 @@ class DomainCollectorApp:
             title="Export activity log",
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile=f"domain-collector-{datetime.now():%Y%m%d-%H%M%S}.log",
+            initialfile=f"domain-atlas-{datetime.now():%Y%m%d-%H%M%S}.log",
         )
         if not path:
             return
@@ -406,9 +406,9 @@ def run_gui(config: Config, config_path: str = DEFAULT_CONFIG_PATH) -> int:
             "tkinter is not available in this Python installation.\n"
             "Install it (Debian/Ubuntu: 'sudo apt install python3-tk', Fedora: "
             "'sudo dnf install python3-tkinter') or run the collector headless "
-            "with:  python domain_collector.py --headless"
+            "with:  python domain_atlas.py --headless"
         ) from TK_IMPORT_ERROR
     root = tk.Tk()
-    DomainCollectorApp(root, config, config_path)
+    DomainAtlasApp(root, config, config_path)
     root.mainloop()
     return 0

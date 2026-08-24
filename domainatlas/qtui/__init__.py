@@ -1,8 +1,5 @@
-"""Modern desktop front-end built on PySide6 (Qt 6).
-
-The Tk UI is kept as a zero-dependency fallback; this one is used whenever
-PySide6 is installed.
-"""
+"""PySide6 desktop front-end. Used whenever PySide6 is installed; the Tk
+interface remains as a fallback."""
 
 from __future__ import annotations
 
@@ -54,13 +51,13 @@ def run_qt_gui(config: Config, config_path: str = DEFAULT_CONFIG_PATH,
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Domain Collector")
-    app.setOrganizationName("DomainCollector")
-    app.setApplicationDisplayName("Domain Collector")
-    app.setStyle("Fusion")  # the one style that themes identically everywhere
+    app.setApplicationName("Domain Atlas")
+    app.setOrganizationName("DomainAtlas")
+    app.setApplicationDisplayName("Domain Atlas")
+    app.setStyle("Fusion")  # renders identically on every platform
 
     if theme is None:
-        theme = str(QSettings("DomainCollector", "DomainCollector").value("theme", "system"))
+        theme = str(QSettings("DomainAtlas", "DomainAtlas").value("theme", "system"))
     if theme not in ("system", "light", "dark"):
         theme = "system"
 
