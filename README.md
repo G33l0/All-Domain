@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/ui-PySide6%20%2F%20Qt%206-41cd52.svg" alt="PySide6">
-  <img src="https://img.shields.io/badge/tests-203%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-215%20passing-brightgreen.svg" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT">
 </p>
 
@@ -271,7 +271,7 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-203 tests cover normalisation, fingerprinting, storage and migration, source parsing and
+215 tests cover normalisation, fingerprinting, storage and migration, source parsing and
 caching, certstream against a local websocket server, the query and export layers, the
 threaded runner, the command line, and the desktop interface. Qt tests run on the
 offscreen platform and are skipped when PySide6 is unavailable.

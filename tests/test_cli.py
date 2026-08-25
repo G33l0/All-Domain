@@ -142,3 +142,33 @@ def test_theme_names_are_validated(capsys):
     with pytest.raises(SystemExit):
         main(["--theme", "chartreuse"])
     assert "--theme must be one of" in capsys.readouterr().err
+
+
+def test_a_closed_pipe_does_not_raise(workdir, monkeypatch, capsys):
+    """`domain-atlas --stats | head` must exit quietly, not traceback."""
+    import sqlite3
+
+    from domainatlas import cli
+
+    path = workdir / "atlas.db"
+    connection = sqlite3.connect(str(path))
+    connection.executescript(
+        """
+        CREATE TABLE domains (fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL,
+            first_seen TIMESTAMP, responsive INTEGER DEFAULT 0, technologies TEXT,
+            status_code INTEGER, scheme TEXT, error TEXT, elapsed_ms INTEGER,
+            source TEXT, checked_at TIMESTAMP);
+        CREATE TABLE domain_tech (fingerprint TEXT, technology TEXT, version TEXT,
+            PRIMARY KEY (fingerprint, technology));
+        INSERT INTO domains (fingerprint, raw, first_seen)
+            VALUES ('a.example', 'a.example', '2026-01-01');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    def explode(*args, **kwargs):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(cli, "run_stats", explode)
+    assert cli.main(["--stats", "--db", str(path)]) == 0

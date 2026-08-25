@@ -30,6 +30,11 @@ class QueryError(RuntimeError):
     """The database could not be read."""
 
 
+def _escape_like(text: str) -> str:
+    """Escape LIKE metacharacters so a search term matches literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @dataclass
 class DomainFilter:
     """Criteria for selecting stored domains."""
@@ -51,8 +56,8 @@ class DomainFilter:
         clauses: List[str] = []
         params: List[Any] = []
         if self.text:
-            clauses.append("d.fingerprint LIKE ?")
-            params.append(f"%{self.text.strip().lower()}%")
+            clauses.append("d.fingerprint LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(self.text.strip().lower())}%")
         if self.technology:
             clauses.append(
                 "EXISTS (SELECT 1 FROM domain_tech t "
@@ -143,6 +148,7 @@ class DomainQuery:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._connection: Optional[sqlite3.Connection] = None
+        self._has_undated = False
 
     def open(self) -> "DomainQuery":
         if not os.path.exists(self.db_path):
@@ -153,6 +159,13 @@ class DomainQuery:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA query_only=1")
             self._connection.execute("PRAGMA busy_timeout=5000")
+            # Databases written before first_seen was backfilled may contain
+            # undated rows; paging only pays for that case when it exists.
+            self._has_undated = bool(
+                self._connection.execute(
+                    "SELECT 1 FROM domains WHERE first_seen IS NULL LIMIT 1"
+                ).fetchone()
+            )
         except sqlite3.Error as exc:
             raise QueryError(f"cannot open {self.db_path}: {exc}") from exc
         return self
@@ -198,12 +211,25 @@ class DomainQuery:
             order_by = "d.fingerprint ASC"
         else:
             if after is not None and after.fingerprint:
-                # Row values compare left to right, matching the index order.
-                # The columns must stay bare: wrapping first_seen in COALESCE
-                # makes the expression unindexable and turns each page into a
-                # full table scan.
-                where += " AND (d.first_seen, d.fingerprint) < (?, ?)"
-                params.extend([after.first_seen or "", after.fingerprint])
+                # Rows are ordered timestamped-first, then undated ones. A
+                # row-value comparison against NULL yields NULL, so the two
+                # groups need separate predicates; a single expression would
+                # silently drop every legacy row that has no timestamp.
+                if after.first_seen:
+                    if self._has_undated:
+                        where += (
+                            " AND (d.first_seen IS NULL"
+                            " OR (d.first_seen, d.fingerprint) < (?, ?))"
+                        )
+                    else:
+                        where += " AND (d.first_seen, d.fingerprint) < (?, ?)"
+                    params.extend([after.first_seen, after.fingerprint])
+                else:
+                    where += " AND d.first_seen IS NULL AND d.fingerprint < ?"
+                    params.append(after.fingerprint)
+            # SQLite sorts NULL lowest, so a plain DESC already places undated
+            # rows last. Adding an "IS NULL" sort key would express the same
+            # order but make the index unusable.
             order_by = "d.first_seen DESC, d.fingerprint DESC"
 
         sql = (
@@ -217,7 +243,7 @@ class DomainQuery:
 
     @staticmethod
     def cursor_for(row: DomainRow) -> Cursor:
-        return Cursor(first_seen=row.first_seen or "", fingerprint=row.fingerprint)
+        return Cursor(first_seen=row.first_seen, fingerprint=row.fingerprint)
 
     def iter_all(
         self, criteria: Optional[DomainFilter] = None, batch_size: int = 2000

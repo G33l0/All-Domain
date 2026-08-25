@@ -319,6 +319,20 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        return _main(argv)
+    except BrokenPipeError:
+        # Standard for a piped command whose reader exits early (`| head`).
+        # Redirect stdout so the interpreter's own flush cannot raise again.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        return 0
+
+
+def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 

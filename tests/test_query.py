@@ -140,3 +140,83 @@ def test_database_is_opened_read_only(database):
     with DomainQuery(database) as query:
         with pytest.raises(sqlite3.OperationalError):
             query.connection.execute("DELETE FROM domains")
+
+
+def _undated_database(tmp_path):
+    path = str(tmp_path / "undated.db")
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE domains (
+            fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL, first_seen TIMESTAMP,
+            responsive INTEGER NOT NULL DEFAULT 0, technologies TEXT, status_code INTEGER,
+            scheme TEXT, error TEXT, elapsed_ms INTEGER, source TEXT, checked_at TIMESTAMP);
+        CREATE TABLE domain_tech (fingerprint TEXT NOT NULL, technology TEXT NOT NULL,
+            version TEXT, PRIMARY KEY (fingerprint, technology));
+        """
+    )
+    for index in range(6):
+        stamp = None if index % 2 else f"2026-01-0{index + 1} 00:00:00"
+        connection.execute(
+            "INSERT INTO domains (fingerprint, raw, first_seen) VALUES (?,?,?)",
+            (f"d{index}.example", f"d{index}.example", stamp),
+        )
+    connection.commit()
+    connection.close()
+    return path
+
+
+def test_rows_without_a_timestamp_are_still_reachable(tmp_path):
+    """Legacy rows with no first_seen must not vanish from the paged view."""
+    path = _undated_database(tmp_path)
+    with DomainQuery(path) as query:
+        assert query._has_undated is True
+        seen = []
+        cursor = None
+        for _ in range(20):
+            rows = query.page(limit=2, after=cursor)
+            if not rows:
+                break
+            seen.extend(row.fingerprint for row in rows)
+            cursor = query.cursor_for(rows[-1])
+    assert len(seen) == len(set(seen)) == 6
+
+
+def test_undated_rows_sort_last(tmp_path):
+    path = _undated_database(tmp_path)
+    with DomainQuery(path) as query:
+        rows = query.page(limit=10)
+    stamps = [row.first_seen for row in rows]
+    assert stamps[:3] == ["2026-01-05 00:00:00", "2026-01-03 00:00:00", "2026-01-01 00:00:00"]
+    assert stamps[3:] == [None, None, None]
+
+
+@pytest.mark.parametrize(
+    "needle,expected",
+    [("a_b", ["a_b.example"]), ("%", []), ("a%b", []), ("axb", ["axb.example"])],
+)
+def test_search_treats_wildcards_literally(tmp_path, needle, expected):
+    path = str(tmp_path / "wild.db")
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE domains (
+            fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL, first_seen TIMESTAMP,
+            responsive INTEGER NOT NULL DEFAULT 0, technologies TEXT, status_code INTEGER,
+            scheme TEXT, error TEXT, elapsed_ms INTEGER, source TEXT, checked_at TIMESTAMP);
+        CREATE TABLE domain_tech (fingerprint TEXT NOT NULL, technology TEXT NOT NULL,
+            version TEXT, PRIMARY KEY (fingerprint, technology));
+        """
+    )
+    for name in ("axb.example", "a_b.example", "plain.example"):
+        connection.execute(
+            "INSERT INTO domains (fingerprint, raw, first_seen) VALUES (?,?,'2026-01-01')",
+            (name, name),
+        )
+    connection.commit()
+    connection.close()
+
+    with DomainQuery(path) as query:
+        found = [row.fingerprint for row in query.page(DomainFilter(text=needle), limit=10)]
+        assert found == expected
+        assert query.count(DomainFilter(text=needle))[0] == len(expected)

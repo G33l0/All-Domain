@@ -14,7 +14,7 @@ from typing import Dict, Optional
 from .config import Config, ConfigError, DEFAULT_CONFIG_PATH
 from .engine import Event
 from .runner import CollectorThread
-from .sources import SOURCE_NAMES
+from .sources import available_sources
 
 try:  # pragma: no cover - import guarded for headless environments
     import tkinter as tk
@@ -224,7 +224,7 @@ class DomainAtlasApp:
         source_frame = tk.Frame(dialog)
         source_frame.grid(row=row, column=1, sticky="w", padx=10, pady=4)
         source_vars: Dict[str, tk.BooleanVar] = {}
-        for name in SOURCE_NAMES:
+        for name in available_sources():
             if name == "file":
                 continue
             var = tk.BooleanVar(value=name in self.config.sources)

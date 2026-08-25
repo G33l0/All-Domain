@@ -441,20 +441,23 @@ class Collector:
     async def _fetch_cycle(self, session: "aiohttp.ClientSession") -> int:
         assert self._queue is not None
         wanted = self.config.max_domains_per_cycle
-        queued = await self._queue_rechecks()
+        # Re-checks have their own budget (recheck_batch) and must not consume
+        # the discovery budget, or a large recheck_batch stops discovery.
+        rechecked = await self._queue_rechecks()
+        queued = 0
         if self.config.recheck_only:
             self.stats.queued = self._queue.qsize()
-            return queued
+            return rechecked
         now = time.monotonic()
         usable = [s for s in self.sources if self._cooldowns.get(s.name, 0.0) <= now]
         if not usable:
             soonest = min(self._cooldowns.values()) - now
             self._log(f"All sources cooling down, retrying in {max(1, int(soonest))}s", "WARN")
-            return queued
+            return rechecked
 
         # Each source gets an equal share of the cycle budget. Serving them in
         # order until the budget ran out let the first source starve the rest.
-        share = max(1, (wanted - queued) // len(usable))
+        share = max(1, wanted // len(usable))
         for index, source in enumerate(usable):
             if self._stop.is_set() or queued >= wanted:
                 break
@@ -479,13 +482,19 @@ class Collector:
                 self._log(f"Source {source.name} raised {type(exc).__name__}: {exc}", "ERROR")
                 continue
 
-            added = 0
+            normalised: List[str] = []
             for candidate in candidates:
+                fingerprint = normalize_domain(candidate)
+                if fingerprint:
+                    normalised.append(fingerprint)
+
+            fresh = await self.store.filter_new(normalised)
+            self.stats.duplicates += len(normalised) - len(fresh)
+
+            added = 0
+            for fingerprint in fresh:
                 if self._stop.is_set():
                     break
-                fingerprint = normalize_domain(candidate)
-                if not fingerprint:
-                    continue
                 if not self.store.reserve(fingerprint):
                     self.stats.duplicates += 1
                     continue
@@ -497,7 +506,7 @@ class Collector:
             self._log(f"{source.name}: {added} new domains queued", "GOOD" if added else "INFO")
 
         self.stats.queued = self._queue.qsize()
-        return queued
+        return queued + rechecked
 
     async def _queue_rechecks(self) -> int:
         """Re-queue domains whose last check is older than ``recheck_after``."""
