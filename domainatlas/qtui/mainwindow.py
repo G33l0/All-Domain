@@ -16,13 +16,13 @@ from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QTextCharFormat
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QFrame,
     QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -59,7 +60,17 @@ from .models import (
     TechnologyTableModel,
 )
 from .theme import Palette, apply_qpalette, palette_for, stylesheet, theme_labels
-from .widgets import Card, NavButton, SearchBox, ShareBarDelegate, StatCard, StatusDotDelegate, StatusPill
+from .widgets import (
+    Card,
+    ElidingLabel,
+    NavButton,
+    ResponsiveGrid,
+    SearchBox,
+    ShareBarDelegate,
+    StatCard,
+    StatusDotDelegate,
+    StatusPill,
+)
 
 POLL_MS = 250
 MAX_LOG_BLOCKS = 3000
@@ -82,7 +93,9 @@ class MainWindow(QMainWindow):
         self._tray: Optional[QSystemTrayIcon] = None
 
         self.setWindowTitle("Domain Atlas")
-        self.setMinimumSize(QSize(1040, 660))
+        # A 1920x1080 display at 200% scaling exposes only 960x540 logical
+        # pixels, and 225% leaves 853x480, so the floor stays below both.
+        self.setMinimumSize(QSize(820, 460))
         self.resize(1240, 780)
 
         self.domain_model = DomainTableModel()
@@ -196,7 +209,7 @@ class MainWindow(QMainWindow):
         titles.setSpacing(1)
         self.page_title = QLabel("Dashboard")
         self.page_title.setObjectName("pageTitle")
-        self.page_subtitle = QLabel("Live discovery and technology fingerprinting")
+        self.page_subtitle = ElidingLabel("Live discovery and technology fingerprinting")
         self.page_subtitle.setObjectName("pageSubtitle")
         titles.addWidget(self.page_title)
         titles.addWidget(self.page_subtitle)
@@ -226,22 +239,22 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
-        grid = QGridLayout()
-        grid.setSpacing(12)
+        cards_area = ResponsiveGrid(min_item_width=150)
         self.cards: Dict[str, StatCard] = {}
         definitions = [
-            ("processed", "Probed", "domains checked"),
-            ("responsive", "Live", "answered a request"),
-            ("unreachable", "Unreachable", "no usable response"),
-            ("new", "New", "stored this run"),
-            ("rechecked", "Re-checked", "refreshed rows"),
-            ("queued", "Queue", "waiting to probe"),
+            ("processed", "Probed", "checked"),
+            ("responsive", "Live", "answered"),
+            ("unreachable", "Down", "no response"),
+            ("new", "New", "this run"),
+            ("rechecked", "Re-checked", "refreshed"),
+            ("queued", "Queue", "waiting"),
         ]
-        for column, (key, label, hint) in enumerate(definitions):
+        for key, label, hint in definitions:
             card = StatCard(label, hint)
-            grid.addWidget(card, 0, column)
+            card.setMinimumWidth(150)
+            cards_area.add(card)
             self.cards[key] = card
-        layout.addLayout(grid)
+        layout.addWidget(cards_area)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -274,52 +287,47 @@ class MainWindow(QMainWindow):
         self.btn_export_domains.clicked.connect(self.export_domains)
         card.add_header_widget(self.btn_export_domains)
 
-        filters = QWidget()
-        filter_row = QHBoxLayout(filters)
-        filter_row.setContentsMargins(0, 0, 0, 0)
-        filter_row.setSpacing(8)
-
         self.domain_search = SearchBox("Search domains…", self.palette_.text_muted)
-        self.domain_search.setMinimumWidth(240)
+        self.domain_search.setMinimumWidth(150)
         self.domain_search.textChanged.connect(self._schedule_reload)
-        filter_row.addWidget(self.domain_search, 1)
+        card.add_widget(self.domain_search)
+
+        # A single fixed row of filters would set a floor on the window width,
+        # so they reflow into as many columns as there is room for.
+        filters = ResponsiveGrid(min_item_width=130, spacing=8)
 
         self.filter_technology = QComboBox()
-        self.filter_technology.setMinimumWidth(160)
         self.filter_technology.addItem("Any technology", None)
         self.filter_technology.currentIndexChanged.connect(self._schedule_reload)
-        filter_row.addWidget(self.filter_technology)
+        filters.add(self.filter_technology)
 
         self.filter_source = QComboBox()
-        self.filter_source.setMinimumWidth(130)
         self.filter_source.addItem("Any source", None)
         self.filter_source.currentIndexChanged.connect(self._schedule_reload)
-        filter_row.addWidget(self.filter_source)
+        filters.add(self.filter_source)
 
         self.filter_status = QComboBox()
-        self.filter_status.setMinimumWidth(120)
         for label, value in (("Any status", None), ("Live only", True), ("Down only", False)):
             self.filter_status.addItem(label, value)
         self.filter_status.currentIndexChanged.connect(self._schedule_reload)
-        filter_row.addWidget(self.filter_status)
+        filters.add(self.filter_status)
 
         self.filter_network = QComboBox()
-        self.filter_network.setMinimumWidth(130)
         for label, value in (("All networks", None), ("Clear web", False), ("Tor (.onion)", True)):
             self.filter_network.addItem(label, value)
         self.filter_network.currentIndexChanged.connect(self._schedule_reload)
-        filter_row.addWidget(self.filter_network)
+        filters.add(self.filter_network)
 
-        self.btn_clear_filters = QPushButton("Clear")
+        self.btn_clear_filters = QPushButton("Clear filters")
         self.btn_clear_filters.clicked.connect(self.clear_filters)
-        filter_row.addWidget(self.btn_clear_filters)
+        filters.add(self.btn_clear_filters)
 
         card.add_widget(filters)
 
         self.stored_table = self._make_stored_table()
         card.add_widget(self.stored_table, 1)
 
-        self.result_label = QLabel("No database opened yet.")
+        self.result_label = ElidingLabel("No database opened yet.")
         self.result_label.setObjectName("pageSubtitle")
         card.add_widget(self.result_label)
 
@@ -344,10 +352,10 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         card = Card("Detected technologies")
         self.tech_search = SearchBox("Filter technologies…", self.palette_.text_muted)
-        self.tech_search.setFixedWidth(240)
+        self.tech_search.setMinimumWidth(150)
         self.tech_search.textChanged.connect(self._apply_tech_filter)
         card.add_header_widget(self.tech_search)
-        open_output = QPushButton("  Open output folder")
+        open_output = QPushButton("  Output folder")
         open_output.clicked.connect(self.open_output_dir)
         self.btn_open_output = open_output
         card.add_header_widget(open_output)
@@ -379,17 +387,27 @@ class MainWindow(QMainWindow):
 
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(12)
+
+        scroller = QScrollArea()
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        content = QWidget()
+        outer = QVBoxLayout(content)
+        outer.setContentsMargins(0, 0, 6, 0)
         outer.setSpacing(12)
 
-        columns = QHBoxLayout()
-        columns.setSpacing(12)
-        columns.setAlignment(Qt.AlignmentFlag.AlignTop)
+        columns = ResponsiveGrid(min_item_width=280)
 
         collection = QGroupBox("Collection")
         form = QFormLayout(collection)
         form.setSpacing(8)
+        # At high scale factors a fixed label column truncates mid-word.
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.in_concurrency = QSpinBox()
         self.in_concurrency.setRange(1, 500)
         self.in_timeout = QDoubleSpinBox()
@@ -408,7 +426,7 @@ class MainWindow(QMainWindow):
         form.addRow("Fetch interval", self.in_interval)
         form.addRow("Domains per cycle", self.in_limit)
         form.addRow("Max queue size", self.in_queue)
-        columns.addWidget(collection, 1)
+        columns.add(collection)
 
         sources = QGroupBox("Sources")
         sources_layout = QVBoxLayout(sources)
@@ -427,9 +445,12 @@ class MainWindow(QMainWindow):
         sources_layout.addWidget(QLabel("Onion index URL"))
         self.in_onion_index = QLineEdit()
         sources_layout.addWidget(self.in_onion_index)
-        sources_layout.addWidget(QLabel("Tor SOCKS proxy (blank = .onion stored, not probed)"))
+        sources_layout.addWidget(QLabel("Tor SOCKS proxy"))
         self.in_tor_proxy = QLineEdit()
         self.in_tor_proxy.setPlaceholderText("socks5://127.0.0.1:9050")
+        self.in_tor_proxy.setToolTip(
+            "Leave blank to store .onion domains without probing them."
+        )
         sources_layout.addWidget(self.in_tor_proxy)
         sources_layout.addWidget(QLabel("Seed file (optional)"))
         seed_row = QHBoxLayout()
@@ -440,19 +461,23 @@ class MainWindow(QMainWindow):
         seed_row.addWidget(browse)
         sources_layout.addLayout(seed_row)
         sources_layout.addStretch(1)
-        columns.addWidget(sources, 1)
+        columns.add(sources)
 
         behaviour = QGroupBox("Storage and re-checks")
         behaviour_form = QFormLayout(behaviour)
         behaviour_form.setSpacing(8)
+        behaviour_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        behaviour_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.in_recheck = QSpinBox()
         self.in_recheck.setRange(0, 31_536_000)
         self.in_recheck.setSuffix(" s")
         self.in_recheck.setSpecialValueText("Disabled")
         self.in_recheck_batch = QSpinBox()
         self.in_recheck_batch.setRange(1, 100_000)
-        self.chk_recheck_only = QCheckBox("Re-check only (no new discovery)")
-        self.chk_tech_files = QCheckBox("Write output/<technology>.txt")
+        self.chk_recheck_only = QCheckBox("Re-check only")
+        self.chk_recheck_only.setToolTip("Refresh stored domains without discovering new ones.")
+        self.chk_tech_files = QCheckBox("Write technology files")
+        self.chk_tech_files.setToolTip("Append each live domain to output/<technology>.txt")
         self.chk_unresponsive = QCheckBox("Store unresponsive domains")
         self.chk_verify_ssl = QCheckBox("Verify TLS certificates")
         self.in_db = QLineEdit()
@@ -467,16 +492,16 @@ class MainWindow(QMainWindow):
         behaviour_form.addRow("", self.chk_verify_ssl)
         for box in (collection, sources, behaviour):
             box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        columns.addWidget(behaviour, 1)
-        columns.setAlignment(collection, Qt.AlignmentFlag.AlignTop)
-        columns.setAlignment(sources, Qt.AlignmentFlag.AlignTop)
-        columns.setAlignment(behaviour, Qt.AlignmentFlag.AlignTop)
-        outer.addLayout(columns)
+            box.setMinimumWidth(280)
+        columns.add(behaviour)
+        outer.addWidget(columns)
         outer.addStretch(1)
+        scroller.setWidget(content)
+        page_layout.addWidget(scroller, 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        self.settings_note = QLabel("Concurrency and sources apply the next time you press Start.")
+        self.settings_note = ElidingLabel("Concurrency and sources apply on the next Start.")
         self.settings_note.setObjectName("pageSubtitle")
         buttons.addWidget(self.settings_note)
         revert = QPushButton("Revert")
@@ -486,7 +511,7 @@ class MainWindow(QMainWindow):
         save.clicked.connect(self._save_settings_form)
         buttons.addWidget(revert)
         buttons.addWidget(save)
-        outer.addLayout(buttons)
+        page_layout.addLayout(buttons)
 
         self._load_settings_form()
         return page
@@ -505,6 +530,7 @@ class MainWindow(QMainWindow):
         table.setWordWrap(False)
         header = table.horizontalHeader()
         header.setStretchLastSection(True)
+        header.setMinimumSectionSize(46)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         table.setColumnWidth(0, 240)
         table.setColumnWidth(1, 90)
@@ -531,6 +557,7 @@ class MainWindow(QMainWindow):
         table.setWordWrap(False)
         header = table.horizontalHeader()
         header.setStretchLastSection(True)
+        header.setMinimumSectionSize(46)
         table.setColumnWidth(0, 260)
         table.setColumnWidth(1, 90)
         table.setColumnWidth(2, 70)
@@ -553,6 +580,7 @@ class MainWindow(QMainWindow):
         table.setShowGrid(False)
         header = table.horizontalHeader()
         header.setStretchLastSection(False)
+        header.setMinimumSectionSize(46)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
@@ -964,6 +992,28 @@ class MainWindow(QMainWindow):
             f"{rate}   ·   cycle {stats.cycles}   ·   queue {stats.queued}"
         )
 
+    #: Below this width the toolbar buttons drop their labels.
+    COMPACT_WIDTH = 1000
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_compact_toolbar(self.width() < self.COMPACT_WIDTH)
+
+    def _apply_compact_toolbar(self, compact: bool) -> None:
+        if getattr(self, "_compact_toolbar", None) == compact:
+            return
+        self._compact_toolbar = compact
+        note = getattr(self, "settings_note", None)
+        if note is not None:
+            note.setVisible(not compact)
+        for button, label in (
+            (self.btn_start, "Start"),
+            (self.btn_pause, "Resume" if self._state == "paused" else "Pause"),
+            (self.btn_stop, "Stop"),
+        ):
+            button.setToolTip(label)
+            button.setText("" if compact else f"  {label}")
+
     def _set_state(self, state: str) -> None:
         self._state = state
         self.status_pill.set_state(state)
@@ -971,7 +1021,11 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(not running and state != "stopping")
         self.btn_pause.setEnabled(running)
         self.btn_stop.setEnabled(running)
-        self.btn_pause.setText("  Resume" if state == "paused" else "  Pause")
+        if getattr(self, "_compact_toolbar", False):
+            self.btn_pause.setText("")
+            self.btn_pause.setToolTip("Resume" if state == "paused" else "Pause")
+        else:
+            self.btn_pause.setText("  Resume" if state == "paused" else "  Pause")
         self.btn_pause.setIcon(
             make_icon("play" if state == "paused" else "pause", self.palette_.text, 15))
         self.status_left.setText(

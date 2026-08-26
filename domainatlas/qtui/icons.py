@@ -63,15 +63,23 @@ def icon_pixmap(name: str, color: str, size: int = 18, stroke: float = 1.8,
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    renderer.render(painter, QRectF(0, 0, size * ratio, size * ratio))
+    # The painter addresses a device-pixel-ratio aware pixmap in logical
+    # units. Scaling the rect by the ratio as well would draw the glyph
+    # several times too large, leaving only its top-left corner visible.
+    renderer.render(painter, QRectF(0, 0, size, size))
     painter.end()
     return pixmap
 
 
+#: Device pixel ratios to rasterise for. 2.0 alone leaves a 200% display
+#: upscaling a half-resolution bitmap, which visibly deforms thin strokes.
+ICON_RATIOS = (1.0, 1.5, 2.0, 2.5, 3.0, 4.0)
+
+
 def make_icon(name: str, color: str, size: int = 18, stroke: float = 1.8) -> QIcon:
-    """A QIcon for *name*, tinted with *color*."""
+    """A QIcon for *name*, tinted with *color*, sharp at every scale factor."""
     icon = QIcon()
-    for ratio in (1.0, 2.0):
+    for ratio in ICON_RATIOS:
         icon.addPixmap(icon_pixmap(name, color, size, stroke, ratio))
     return icon
 

@@ -277,3 +277,100 @@ def test_pump_survives_a_broken_collector(window):
     window.collector = Boom()
     window._pump()  # must not raise
     assert "kaboom" in window.log_view.toPlainText()
+
+
+# --------------------------------------------------------------- high DPI
+def test_icons_are_identical_at_every_device_pixel_ratio(qapp):
+    """A DPR-tagged pixmap is painted in logical units.
+
+    Scaling the render rect by the ratio as well drew the glyph several times
+    too large, so a 200% display showed only its top-left corner.
+    """
+    from PySide6.QtCore import Qt
+
+    for name in ("dashboard", "settings", "play"):
+        base = icon_pixmap(name, "#ffffff", 16, ratio=1.0).toImage()
+        for ratio in (2.0, 4.0):
+            scaled = icon_pixmap(name, "#ffffff", 16, ratio=ratio)
+            assert scaled.devicePixelRatio() == ratio
+            assert scaled.width() == int(16 * ratio)
+            # Downsampled back to 1x the artwork must match the 1x render.
+            shrunk = scaled.toImage().scaled(
+                16, 16, Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            differing = sum(
+                1
+                for y in range(16)
+                for x in range(16)
+                if abs(shrunk.pixelColor(x, y).alpha() - base.pixelColor(x, y).alpha()) > 120
+            )
+            assert differing < 40, f"{name} at {ratio}x differs in {differing} pixels"
+
+
+def test_logo_is_identical_at_every_device_pixel_ratio(qapp):
+    from domainatlas.qtui.logo import logo_pixmap
+
+    for ratio in (1.0, 2.0, 4.0):
+        pixmap = logo_pixmap(32, ratio)
+        assert pixmap.devicePixelRatio() == ratio
+        assert pixmap.width() == int(32 * ratio)
+        image = pixmap.toImage()
+        # A mis-scaled render fills only the top-left quadrant, leaving the
+        # lower right of the tile blank. The extreme corner is transparent by
+        # design because the tile is rounded, so sample inside the radius.
+        inset = int(image.width() * 0.82)
+        assert image.pixelColor(inset, inset).alpha() > 0
+        assert image.pixelColor(image.width() // 2, image.height() // 2).alpha() > 0
+
+
+def test_window_fits_a_1080p_display_at_200_percent(window):
+    """1920x1080 at 200% scaling exposes 960x540 logical pixels."""
+    minimum = window.minimumSizeHint().expandedTo(window.minimumSize())
+    assert minimum.width() <= 960
+    assert minimum.height() <= 540
+
+
+def test_settings_page_is_scrollable(window):
+    from PySide6.QtWidgets import QScrollArea
+
+    window._select_page(4)
+    assert window.pages.widget(4).findChildren(QScrollArea)
+
+
+def test_toolbar_drops_labels_when_narrow(window):
+    window._apply_compact_toolbar(True)
+    assert window.btn_start.text().strip() == ""
+    assert window.btn_start.toolTip() == "Start"
+    window._apply_compact_toolbar(False)
+    assert window.btn_start.text().strip() == "Start"
+
+
+def test_eliding_label_reports_a_small_minimum(qapp):
+    from domainatlas.qtui.widgets import ElidingLabel
+
+    label = ElidingLabel("A caption long enough to force a wide minimum width")
+    label.resize(60, 20)
+    label._apply_elide()
+    assert label.minimumSizeHint().width() <= 40
+    assert label.text() != label.fullText()      # elided
+    assert label.toolTip() == label.fullText()
+
+
+def test_responsive_grid_reflows_by_width(qapp):
+    from PySide6.QtWidgets import QLabel
+
+    from domainatlas.qtui.widgets import ResponsiveGrid
+
+    grid = ResponsiveGrid(min_item_width=100, spacing=10)
+    for index in range(6):
+        grid.add(QLabel(f"item {index}"))
+
+    grid.resize(660, 100)
+    grid._relayout()
+    assert grid._columns == 6
+
+    grid.resize(230, 200)
+    grid._relayout()
+    assert grid._columns == 2
+    assert grid.minimumSizeHint().width() <= 100

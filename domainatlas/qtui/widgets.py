@@ -8,6 +8,7 @@ from PySide6.QtCore import QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -147,6 +148,102 @@ class NavButton(QPushButton):
 
     def retint(self, color: str) -> None:
         self.setIcon(make_icon(self.icon_name, color, 17))
+
+
+class ElidingLabel(QLabel):
+    """A label that shortens its text to fit instead of forcing width.
+
+    A plain QLabel reports the full text width as its minimum, which stops the
+    window being resized below it.
+    """
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self.setMinimumWidth(40)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = text or ""
+        self.setToolTip(self._full_text)
+        self._apply_elide()
+
+    def fullText(self) -> str:
+        return self._full_text
+
+    def _apply_elide(self) -> None:
+        metrics = self.fontMetrics()
+        available = max(0, self.width() - 2)
+        super().setText(metrics.elidedText(self._full_text, Qt.TextElideMode.ElideRight, available))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def setGeometry(self, *args) -> None:
+        super().setGeometry(*args)
+        self._apply_elide()
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        return QSize(40, hint.height())
+
+
+class ResponsiveGrid(QWidget):
+    """Lays widgets out in as many columns as the current width allows.
+
+    Qt propagates a layout's minimum width up to the window, so a fixed row of
+    panels stops the window being resized below their combined width. This
+    reflows instead, and reports the width of a single item as its minimum.
+    """
+
+    def __init__(self, min_item_width: int = 160, spacing: int = 12, parent=None) -> None:
+        super().__init__(parent)
+        self.min_item_width = max(40, int(min_item_width))
+        self._items: list = []
+        self._columns = 0
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(spacing)
+
+    def add(self, widget: QWidget) -> None:
+        self._items.append(widget)
+        self._columns = 0          # force a re-layout
+        self._relayout()
+
+    def _fitting_columns(self) -> int:
+        if not self._items:
+            return 1
+        spacing = self._grid.spacing()
+        usable = max(self.width(), self.min_item_width)
+        columns = max(1, (usable + spacing) // (self.min_item_width + spacing))
+        return int(min(columns, len(self._items)))
+
+    def _relayout(self) -> None:
+        columns = self._fitting_columns()
+        if columns == self._columns:
+            return
+        self._columns = columns
+        while self._grid.count():
+            self._grid.takeAt(0)
+        for index, widget in enumerate(self._items):
+            self._grid.addWidget(widget, index // columns, index % columns,
+                                 Qt.AlignmentFlag.AlignTop)
+        for column in range(self._grid.columnCount()):
+            self._grid.setColumnStretch(column, 1 if column < columns else 0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._relayout()
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        return QSize(self.min_item_width, hint.height())
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        return QSize(max(self.min_item_width, hint.width()), hint.height())
 
 
 class ShareBarDelegate(QStyledItemDelegate):

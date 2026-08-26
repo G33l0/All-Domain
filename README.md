@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/ui-PySide6%20%2F%20Qt%206-41cd52.svg" alt="PySide6">
-  <img src="https://img.shields.io/badge/tests-215%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-222%20passing-brightgreen.svg" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT">
 </p>
 
@@ -148,6 +148,19 @@ Linux and macOS.
 All database work happens on a worker thread, so filtering or scrolling a large
 inventory never blocks the interface.
 
+### Display scaling
+
+The interface is verified at every Windows scaling level from 100% to 225%.
+Panels reflow into fewer columns as the window narrows, the toolbar drops its
+labels, captions elide rather than forcing the window wider, and the Settings
+page scrolls. The window can shrink to 820x460 logical pixels, which fits a
+1920x1080 display at 200% scaling (960x540 logical) and any 4K display up to
+300%.
+
+<p align="center">
+  <img src="docs/screenshots/dashboard-200-percent.png" alt="Domain Atlas at 200% display scaling" width="760">
+</p>
+
 ### Themes
 
 | | | |
@@ -271,7 +284,7 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-215 tests cover normalisation, fingerprinting, storage and migration, source parsing and
+222 tests cover normalisation, fingerprinting, storage and migration, source parsing and
 caching, certstream against a local websocket server, the query and export layers, the
 threaded runner, the command line, and the desktop interface. Qt tests run on the
 offscreen platform and are skipped when PySide6 is unavailable.

@@ -115,7 +115,8 @@ def logo_pixmap(size: int, ratio: float = 1.0, tile: bool = True) -> QPixmap:
     pixmap.setDevicePixelRatio(ratio)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
-    draw_logo(painter, size * ratio, tile=tile)
+    # Logical units: the ratio is carried by the pixmap, not the geometry.
+    draw_logo(painter, float(size), tile=tile)
     painter.end()
     return pixmap
 
