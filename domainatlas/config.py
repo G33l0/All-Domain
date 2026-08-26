@@ -23,8 +23,11 @@ DEFAULT_USER_AGENT = (
 #: certstream-server-go instance for a reliable feed.
 DEFAULT_CERTSTREAM_URL = "wss://certstream.calidog.io/domains-only"
 
-#: Sources enabled when the user does not choose explicitly.
-DEFAULT_SOURCES: List[str] = ["crtsh", "tranco", "umbrella"]
+#: Sources enabled when the user does not choose explicitly. The two that need
+#: no third-party service lead: "self" recycles the collector's own findings and
+#: "ctlog" reads Certificate Transparency logs directly from their operators.
+#: The ranking lists follow, to seed a cold start and to cover an outage.
+DEFAULT_SOURCES: List[str] = ["self", "ctlog", "tranco", "umbrella"]
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
@@ -101,6 +104,14 @@ class Config:
     tor_proxy: str = ""
     #: Public index used by the "onion" source.
     onion_index_url: str = "https://ahmia.fi/onions/"
+    #: Certificate Transparency logs to read. Empty uses the built-in list.
+    ct_logs: List[Dict[str, str]] = field(default_factory=list)
+    #: Feed host names found in fetched pages back into the queue.
+    expand_from_html: bool = True
+    #: Feed host names from probed TLS certificates back into the queue.
+    expand_from_certificates: bool = True
+    #: Upper bound on self-discovered candidates held for later.
+    frontier_limit: int = 500_000
     db_path: str = "domains.db"
     output_dir: str = "output"
     cache_dir: str = ".cache"
@@ -154,6 +165,20 @@ class Config:
         self.store_unresponsive = _as_bool("store_unresponsive", self.store_unresponsive, defaults.store_unresponsive)
         self.use_builtwith = _as_bool("use_builtwith", self.use_builtwith, defaults.use_builtwith)
         self.recheck_only = _as_bool("recheck_only", self.recheck_only, defaults.recheck_only)
+        self.expand_from_html = _as_bool("expand_from_html", self.expand_from_html,
+                                         defaults.expand_from_html)
+        self.expand_from_certificates = _as_bool(
+            "expand_from_certificates", self.expand_from_certificates,
+            defaults.expand_from_certificates,
+        )
+        self.frontier_limit = _as_int("frontier_limit", self.frontier_limit, 0, 50_000_000,
+                                      defaults.frontier_limit)
+        if not isinstance(self.ct_logs, list):
+            raise ConfigError("ct_logs must be a list of {name, url} objects")
+        for entry in self.ct_logs:
+            if not isinstance(entry, dict) or not entry.get("url"):
+                raise ConfigError("each ct_logs entry needs a url")
+            entry.setdefault("name", entry["url"])
         if self.recheck_only and self.recheck_after <= 0:
             raise ConfigError("recheck_only needs recheck_after to be greater than 0")
 

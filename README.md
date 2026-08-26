@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/ui-PySide6%20%2F%20Qt%206-41cd52.svg" alt="PySide6">
-  <img src="https://img.shields.io/badge/tests-222%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-245%20passing-brightgreen.svg" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT">
 </p>
 
@@ -26,9 +26,10 @@ from a terminal.
 
 ## Features
 
-- **Multiple discovery sources** — live Certificate Transparency over certstream, crt.sh
-  searches, the Tranco, Cisco Umbrella and Majestic ranking lists, Tor hidden-service
-  indexes, and local seed files. Sources fail independently and are retried on a cooldown.
+- **Discovery that does not depend on a third party** — Certificate Transparency logs are
+  read directly over RFC 6962 from several independent operators, and every probe feeds
+  its own findings back into the queue. Aggregators and ranking lists are fallbacks, not
+  the foundation. Sources fail independently and are retried on a cooldown.
 - **Technology fingerprinting** — 70+ built-in rules covering web servers, CDNs, CMSs,
   frameworks, JavaScript libraries, analytics and security headers, with version capture,
   derived from response headers, cookies, meta tags and HTML.
@@ -112,7 +113,7 @@ python domain_atlas.py --export - --filter-source certstream --filter-since 2026
 | `--timeout SECONDS` | Per-request timeout (default 10) |
 | `--interval SECONDS` | Delay between fetch cycles (default 1800) |
 | `--limit N` | Domains queued per cycle (default 500) |
-| `--sources LIST` | `crtsh`, `certstream`, `tranco`, `umbrella`, `majestic`, `onion`, `file` |
+| `--sources LIST` | `self`, `ctlog`, `crtsh`, `certstream`, `tranco`, `umbrella`, `majestic`, `onion`, `file` |
 | `--seed-file PATH` | Local candidate list, one domain per line |
 | `--certstream-url URL` | Certstream websocket endpoint |
 | `--tor-proxy URL` | SOCKS5 proxy for `.onion` probing |
@@ -200,7 +201,11 @@ on load.
 | `db_path` | `domains.db` | SQLite inventory |
 | `output_dir` | `output` | Per-technology text files |
 | `cache_dir` | `.cache` | Cached source lists and read positions |
-| `sources` | `crtsh, tranco, umbrella` | Enabled feeds, tried in order |
+| `sources` | `self, ctlog, tranco, umbrella` | Enabled feeds, budget shared evenly |
+| `ct_logs` | *(built-in list)* | Certificate Transparency logs to read |
+| `expand_from_html` | `true` | Queue host names linked from fetched pages |
+| `expand_from_certificates` | `true` | Queue host names from probed TLS certificates |
+| `frontier_limit` | `500000` | Cap on self-discovered candidates held for later |
 | `certstream_url` | `wss://certstream.calidog.io/domains-only` | Certificate Transparency stream |
 | `onion_index_url` | `https://ahmia.fi/onions/` | Public hidden-service index |
 | `tor_proxy` | *(empty)* | SOCKS5 proxy for `.onion` probing |
@@ -212,12 +217,44 @@ on load.
 | `store_unresponsive` | `true` | Keep unreachable domains in the inventory |
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
+## Discovery without a dependency
+
+Two of the sources need no third-party service, and they are the defaults.
+
+**`ctlog` reads Certificate Transparency directly.** crt.sh and certstream are
+aggregators sitting on top of the CT ecosystem, and they are the usual point of failure —
+crt.sh returns HTTP 502 for days at a time, and the public certstream endpoint accepts
+connections then streams nothing. The logs themselves are a public append-only protocol
+(RFC 6962) served by the operators: Cloudflare, DigiCert, Sectigo, Google, Let's Encrypt.
+Domain Atlas rotates across them, checkpoints its read position per log so a restart
+resumes rather than replays, and parses certificates with a small DER scan rather than a
+cryptography dependency. One operator returning 5xx costs nothing; the others carry the
+cycle.
+
+**`self` recycles the collector's own findings.** Every probe already downloads a page and
+completes a TLS handshake, and both name further hosts. Those host names are normalised
+and queued in the database, so the source needs no network of its own. In practice each
+probe yields more than one new candidate, so the queue grows faster than it drains: seed
+the collector once and it keeps working with every external feed offline. The frontier is
+persistent, so a restart resumes with a backlog rather than an empty queue.
+
+```bash
+# no aggregator, no ranking list
+python domain_atlas.py --headless --sources ctlog
+
+# no network source at all, running purely off what it found before
+python domain_atlas.py --headless --sources self
+```
+
+---
+
 ## Architecture
 
 ```
 domainatlas/
   cli.py        command line entry point and argument handling
   config.py     validated settings, loaded from and saved to JSON
+  ctlog.py      Certificate Transparency reading and certificate parsing
   domains.py    parsing, validation and normalisation of host names
   engine.py     producer/consumer collection loop
   sources.py    discovery feeds and the source registry
@@ -284,7 +321,7 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-222 tests cover normalisation, fingerprinting, storage and migration, source parsing and
+245 tests cover normalisation, fingerprinting, storage and migration, source parsing and
 caching, certstream against a local websocket server, the query and export layers, the
 threaded runner, the command line, and the desktop interface. Qt tests run on the
 offscreen platform and are skipped when PySide6 is unavailable.
@@ -292,9 +329,10 @@ offscreen platform and are skipped when PySide6 is unavailable.
 ## Scope and limits
 
 - No source enumerates the entire DNS namespace, and Domain Atlas does not claim to.
-  It aggregates what public feeds publish — Certificate Transparency covers any host that
-  has ever been issued a TLS certificate, which is the broadest practical view available.
-  Coverage grows with the number of configured sources and how long the collector runs.
+  Certificate Transparency covers any host that has ever been issued a TLS certificate,
+  which is the broadest practical view available, and self-expansion reaches whatever
+  those hosts link to. Coverage grows with the number of configured sources and how long
+  the collector runs.
 - Hidden services are discovered from public clear-web indexes. Probing them requires a
   running Tor daemon and `aiohttp-socks`; without those, `.onion` records are stored and
   exportable but marked as unprobed.

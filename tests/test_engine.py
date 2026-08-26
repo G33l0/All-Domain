@@ -3,6 +3,7 @@
 import asyncio
 
 import aiohttp
+import pytest
 import pytest_asyncio
 from aiohttp import web
 
@@ -452,3 +453,136 @@ async def test_sources_share_the_cycle_budget(tmp_path):
     with DomainQuery(config.db_path) as query:
         stored = {row.fingerprint[0] for row in query.page(limit=50)}
     assert stored == {"a", "b", "c"}
+
+
+def test_hosts_are_harvested_from_page_markup():
+    from domainatlas.engine import hosts_in_html
+
+    html = (
+        '<a href="https://partner.example/path">x</a>'
+        '<script src="//cdn.jsdelivr.net/lib.js"></script>'
+        '<img src="http://images.other.example/a.png">'
+        '<link href="https://fonts.googleapis.com/css">'
+        'plain text https://mentioned.example/page'
+    )
+    found = hosts_in_html(html)
+    assert "partner.example" in found
+    assert "images.other.example" in found
+    assert "mentioned.example" in found
+    # Ubiquitous asset hosts add nothing to an inventory.
+    assert "cdn.jsdelivr.net" not in found
+    assert "fonts.googleapis.com" not in found
+
+
+def test_html_harvest_is_bounded_and_safe():
+    from domainatlas.engine import hosts_in_html
+
+    assert hosts_in_html("") == []
+    assert hosts_in_html(None) == []
+    crowded = " ".join(f'<a href="https://h{i}.example/">x</a>' for i in range(500))
+    assert len(hosts_in_html(crowded, limit=25)) == 25
+
+
+def test_certificate_harvest_tolerates_a_missing_connection():
+    from domainatlas.engine import hosts_in_certificate
+
+    assert hosts_in_certificate(None) == []
+
+    class Useless:
+        def getpeercert(self, binary_form=False):
+            raise OSError("not connected")
+
+    assert hosts_in_certificate(Useless()) == []
+
+    class Empty:
+        def getpeercert(self, binary_form=False):
+            return b""
+
+    assert hosts_in_certificate(Empty()) == []
+
+
+async def test_discoveries_feed_the_frontier(tmp_path):
+    """A probe's own findings become candidates for the next cycle."""
+    from domainatlas.engine import ProbeResult
+    from domainatlas.store import DomainStore
+
+    config = _recheck_config(tmp_path)
+    source = StubSource(["seed.example"], cache_dir=str(tmp_path))
+    collector = Collector(config, sources=[source])
+
+    async def probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(
+            responsive=True, reached=True, status_code=200, technologies=[],
+            discovered=["found-a.example", "found-b.example", "seed.example", "not a domain"],
+        )
+
+    stats = await _run_one_cycle(collector, probe)
+    assert stats.discovered == 2          # the origin and the junk are dropped
+
+    store = DomainStore(config.db_path, config.output_dir)
+    await store.open()
+    try:
+        queued = await store.take_frontier(10)
+        assert sorted(queued) == ["found-a.example", "found-b.example"]
+    finally:
+        await store.close()
+
+
+async def test_self_source_runs_without_any_network(tmp_path):
+    from domainatlas.sources import SelfExpansionSource, SourceError
+    from domainatlas.store import DomainStore
+
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        source = SelfExpansionSource(store=store, user_agent="test", cache_dir=str(tmp_path))
+
+        with pytest.raises(SourceError, match="nothing discovered yet"):
+            await source.fetch(session=None, limit=5)
+
+        await store.push_frontier(["a.example", "b.example"])
+        assert sorted(await source.fetch(session=None, limit=5)) == ["a.example", "b.example"]
+    finally:
+        await store.close()
+
+
+async def test_an_empty_source_is_not_put_on_cooldown(tmp_path):
+    """A healthy source with nothing queued yet must not be penalised.
+
+    The self-expansion frontier is empty on a cold start and fills within
+    seconds; a failure cooldown would keep it idle for a minute.
+    """
+    from domainatlas.engine import ProbeResult
+    from domainatlas.sources import SourceEmpty
+
+    class EmptyThenReady(Source):
+        name = "eventually"
+
+        def __init__(self, **kwargs):
+            kwargs.setdefault("user_agent", "test")
+            super().__init__(**kwargs)
+            self.calls = 0
+
+        async def fetch(self, session, limit):
+            self.calls += 1
+            if self.calls == 1:
+                raise SourceEmpty("nothing yet")
+            return ["ready.example"]
+
+    config = _recheck_config(tmp_path, fetch_interval=10)
+    source = EmptyThenReady(cache_dir=str(tmp_path))
+    events = []
+    collector = Collector(config, on_event=events.append, sources=[source])
+
+    async def probe(session, domain, cfg, ssl_arg=None):
+        return ProbeResult(responsive=True, reached=True, status_code=200)
+
+    await _run_one_cycle(collector, probe)
+    assert source.calls == 1
+    assert collector.stats.source_fail["eventually"] == 0
+    assert "eventually" not in collector._cooldowns
+    assert not any("pausing it" in event.message for event in events)
+
+    stats = await _run_one_cycle(collector, probe)
+    assert source.calls == 2
+    assert stats.processed == 1

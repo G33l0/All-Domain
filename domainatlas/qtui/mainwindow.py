@@ -247,6 +247,7 @@ class MainWindow(QMainWindow):
             ("unreachable", "Down", "no response"),
             ("new", "New", "this run"),
             ("rechecked", "Re-checked", "refreshed"),
+            ("discovered", "Self-found", "from responses"),
             ("queued", "Queue", "waiting"),
         ]
         for key, label, hint in definitions:
@@ -979,6 +980,7 @@ class MainWindow(QMainWindow):
             "unreachable": stats.unreachable,
             "new": stats.new,
             "rechecked": stats.rechecked,
+            "discovered": stats.discovered,
             "queued": stats.queued,
         }
         for key, value in values.items():

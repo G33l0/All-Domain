@@ -27,11 +27,13 @@ from typing import Dict, List, Optional, Sequence
 
 import aiohttp
 
+from .ctlog import DEFAULT_CT_LOGS, LogState, names_from_entries
 from .domains import normalize_all, normalize_domain
 from .httputil import read_capped
 
 __all__ = [
     "Source",
+    "SourceEmpty",
     "SourceError",
     "SOURCE_CLASSES",
     "available_sources",
@@ -43,6 +45,15 @@ __all__ = [
 
 class SourceError(RuntimeError):
     """A feed could not be read this cycle."""
+
+
+class SourceEmpty(SourceError):
+    """A healthy feed that simply has nothing to offer right now.
+
+    Distinguished from a failure so the engine does not put a working source
+    on a cooldown: the self-expansion frontier is empty on a cold start and
+    fills within seconds.
+    """
 
 
 async def _get(
@@ -353,7 +364,7 @@ class CertStreamSource(Source):
         if not self._buffer:
             if self._last_error:
                 raise SourceError(f"certstream: {self._last_error}")
-            raise SourceError(
+            raise SourceEmpty(
                 f"certstream: no certificates received from {self.url} within {self.wait:.0f}s"
             )
         drained: List[str] = []
@@ -460,6 +471,141 @@ def _parse_certstream(payload: str) -> List[str]:
     return names
 
 
+class CertificateTransparencySource(Source):
+    """Reads Certificate Transparency logs directly, over RFC 6962.
+
+    This is the same data crt.sh and certstream expose, taken from the log
+    operators instead of from an aggregator. Several independent operators are
+    rotated, so one returning 5xx costs nothing. Progress is checkpointed per
+    log, so a restart resumes rather than replaying.
+    """
+
+    name = "ctlog"
+    #: Logs cap how many entries one request may return.
+    BATCH = 256
+    #: Requests per fetch before yielding what has been collected.
+    MAX_REQUESTS = 8
+    #: How far back to start on a log never read before.
+    COLD_START_DEPTH = 2000
+
+    def __init__(self, logs=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.logs = [LogState(name=entry["name"], url=entry["url"])
+                     for entry in (logs or DEFAULT_CT_LOGS)]
+        self._next_log = 0
+
+    # ------------------------------------------------------------ checkpoints
+    def _position_path(self, log: LogState) -> str:
+        return self._cache_path(f"ct-{log.name}.pos")
+
+    def _load_position(self, log: LogState) -> Optional[int]:
+        try:
+            with open(self._position_path(log), "r", encoding="utf-8") as handle:
+                return int(handle.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _save_position(self, log: LogState, position: int) -> None:
+        try:
+            with open(self._position_path(log), "w", encoding="utf-8") as handle:
+                handle.write(str(position))
+        except OSError:
+            pass
+
+    # ----------------------------------------------------------------- fetch
+    async def fetch(self, session: "aiohttp.ClientSession", limit: int) -> List[str]:
+        errors: List[str] = []
+        collected: List[str] = []
+
+        for _ in range(len(self.logs)):
+            log = self.logs[self._next_log % len(self.logs)]
+            self._next_log += 1
+            try:
+                names = await self._read_log(session, log, limit)
+            except asyncio.CancelledError:
+                raise
+            except SourceError as exc:
+                log.failures += 1
+                errors.append(str(exc))
+                continue
+            except Exception as exc:
+                log.failures += 1
+                errors.append(f"{log.name}: {type(exc).__name__}: {exc}")
+                continue
+            log.failures = 0
+            collected.extend(names)
+            if len(collected) >= limit:
+                break
+
+        if not collected:
+            raise SourceError(
+                "no certificate transparency log responded ("
+                + "; ".join(errors[:3]) + ")" if errors else "no entries returned"
+            )
+        return normalize_all(collected)[:limit]
+
+    async def _read_log(self, session: "aiohttp.ClientSession",
+                        log: LogState, limit: int) -> List[str]:
+        payload = await _get(session, log.url + "ct/v1/get-sth",
+                             timeout=max(self.timeout, 20.0), max_bytes=64 * 1024,
+                             retries=1)
+        try:
+            log.tree_size = int(json.loads(payload.decode("utf-8", "ignore"))["tree_size"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise SourceError(f"{log.name}: unusable signed tree head ({exc})") from exc
+
+        position = self._load_position(log)
+        if position is None or position > log.tree_size:
+            # Start near the head: replaying billions of historic entries would
+            # take days before reaching anything current.
+            position = max(0, log.tree_size - self.COLD_START_DEPTH)
+        if position >= log.tree_size:
+            raise SourceError(f"{log.name}: no new entries")
+
+        names: List[str] = []
+        requests = 0
+        while len(names) < limit and position < log.tree_size and requests < self.MAX_REQUESTS:
+            end = min(position + self.BATCH - 1, log.tree_size - 1)
+            body = await _get(
+                session, f"{log.url}ct/v1/get-entries?start={position}&end={end}",
+                timeout=max(self.timeout, 30.0), max_bytes=32 * 1024 * 1024, retries=1,
+            )
+            requests += 1
+            try:
+                entries = json.loads(body.decode("utf-8", "ignore")).get("entries", [])
+            except ValueError as exc:
+                raise SourceError(f"{log.name}: unreadable entries ({exc})") from exc
+            if not entries:
+                break
+            names.extend(names_from_entries(entries))
+            position += len(entries)
+            self._save_position(log, position)
+        return names
+
+
+class SelfExpansionSource(Source):
+    """Domains discovered by the collector itself, from its own responses.
+
+    Every probe already downloads a page and completes a TLS handshake, both of
+    which name further hosts. Those are queued in the database, so this source
+    needs no network of its own and keeps working when every feed is down.
+    """
+
+    name = "self"
+
+    def __init__(self, store=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.store = store
+
+    async def fetch(self, session: "aiohttp.ClientSession", limit: int) -> List[str]:
+        if self.store is None:
+            raise SourceError("self-expansion is not connected to a store")
+        found = await self.store.take_frontier(limit)
+        if not found:
+            raise SourceEmpty("nothing discovered yet; another source has to seed it")
+        return found
+
+
 class OnionIndexSource(Source):
     """Tor hidden services listed by a public clearnet index.
 
@@ -519,6 +665,8 @@ class SeedFileSource(Source):
 
 
 SOURCE_CLASSES: Dict[str, type] = {
+    SelfExpansionSource.name: SelfExpansionSource,
+    CertificateTransparencySource.name: CertificateTransparencySource,
     CrtShSource.name: CrtShSource,
     CertStreamSource.name: CertStreamSource,
     TrancoSource.name: TrancoSource,
@@ -606,6 +754,12 @@ def build_sources(config) -> List[Source]:
             raise ValueError(
                 f"unknown source {name!r}; valid sources: {', '.join(available_sources())}"
             )
+        if cls is SelfExpansionSource:
+            sources.append(SelfExpansionSource(store=getattr(config, "_store", None), **kwargs))
+            continue
+        if cls is CertificateTransparencySource:
+            sources.append(CertificateTransparencySource(logs=config.ct_logs or None, **kwargs))
+            continue
         if cls is OnionIndexSource:
             sources.append(OnionIndexSource(url=config.onion_index_url, **kwargs))
             continue

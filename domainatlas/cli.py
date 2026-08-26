@@ -212,9 +212,9 @@ async def run_headless(config: Config, cycles: Optional[int]) -> int:
     stats = await collector.run(cycles=cycles)
     logger.info(
         "Finished: %d probed, %d responsive, %d unreachable, %d new, %d re-checked, "
-        "%d errors in %d cycle(s) (%.1f/s)",
+        "%d self-discovered, %d errors in %d cycle(s) (%.1f/s)",
         stats.processed, stats.responsive, stats.unreachable, stats.new,
-        stats.rechecked, stats.errors, stats.cycles, stats.rate,
+        stats.rechecked, stats.discovered, stats.errors, stats.cycles, stats.rate,
     )
     if stats.tech_counts:
         logger.info("Top technologies: %s", ", ".join(

@@ -308,3 +308,72 @@ async def test_undated_rows_are_backfilled_on_open(tmp_path):
             "SELECT first_seen FROM domains WHERE fingerprint = 'undated.example'"
         ).fetchone()[0]
     assert stamp is not None
+
+
+async def test_frontier_round_trip(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        assert await store.push_frontier(["a.example", "b.example"], origin="seed.example") == 2
+        assert await store.frontier_size() == 2
+
+        taken = await store.take_frontier(1)
+        assert len(taken) == 1
+        assert await store.frontier_size() == 1
+
+        rest = await store.take_frontier(10)
+        assert len(rest) == 1
+        assert await store.take_frontier(10) == []
+    finally:
+        await store.close()
+
+
+async def test_frontier_skips_domains_already_stored(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        await store.add(DomainRecord("known.example", "known.example", True, []))
+        await store.flush()
+        assert await store.push_frontier(["known.example", "fresh.example"]) == 1
+        assert await store.take_frontier(10) == ["fresh.example"]
+    finally:
+        await store.close()
+
+
+async def test_frontier_deduplicates(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        await store.push_frontier(["x.example", "x.example"])
+        await store.push_frontier(["x.example"])
+        assert await store.frontier_size() == 1
+    finally:
+        await store.close()
+
+
+async def test_frontier_is_bounded(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"), frontier_limit=3)
+    await store.open()
+    try:
+        await store.push_frontier([f"d{i}.example" for i in range(10)])
+        assert await store.frontier_size() <= 3
+        await store.push_frontier([f"e{i}.example" for i in range(10)])
+        assert await store.trim_frontier() >= 0
+        assert await store.frontier_size() <= 3
+    finally:
+        await store.close()
+
+
+async def test_frontier_survives_a_restart(tmp_path):
+    path = str(tmp_path / "d.db")
+    first = DomainStore(path, str(tmp_path / "out"))
+    await first.open()
+    await first.push_frontier(["persist.example"], origin="seed")
+    await first.close()
+
+    second = DomainStore(path, str(tmp_path / "out"))
+    await second.open()
+    try:
+        assert await second.take_frontier(10) == ["persist.example"]
+    finally:
+        await second.close()

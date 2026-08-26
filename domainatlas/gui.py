@@ -89,7 +89,8 @@ class DomainAtlasApp:
         frame = tk.Frame(self.root)
         frame.pack(fill=tk.X, padx=10, pady=4)
         self.stat_labels: Dict[str, tk.Label] = {}
-        for key in ("Processed", "Responsive", "Unreachable", "New", "Re-checked", "Queue", "Rate"):
+        for key in ("Processed", "Responsive", "Unreachable", "New", "Re-checked",
+                    "Self-found", "Queue", "Rate"):
             label = tk.Label(frame, text=f"{key}: 0", font=("Arial", 10))
             label.pack(side=tk.LEFT, padx=8)
             self.stat_labels[key] = label
@@ -354,6 +355,7 @@ class DomainAtlasApp:
         self.stat_labels["New"].config(text=f"New: {stats.new}")
         self.stat_labels["Unreachable"].config(text=f"Unreachable: {stats.unreachable}")
         self.stat_labels["Re-checked"].config(text=f"Re-checked: {stats.rechecked}")
+        self.stat_labels["Self-found"].config(text=f"Self-found: {stats.discovered}")
         self.stat_labels["Queue"].config(text=f"Queue: {stats.queued}")
         self.stat_labels["Rate"].config(text=f"Rate: {stats.rate:.1f}/s")
 

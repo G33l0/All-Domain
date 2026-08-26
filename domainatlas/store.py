@@ -74,6 +74,7 @@ class DomainStore:
         flush_size: int = 50,
         flush_interval: float = 1.0,
         cache_limit: Optional[int] = None,
+        frontier_limit: int = 500_000,
     ) -> None:
         self.db_path = db_path
         self.output_dir = output_dir
@@ -81,6 +82,7 @@ class DomainStore:
         self.flush_size = max(1, int(flush_size))
         self.flush_interval = max(0.05, float(flush_interval))
         self.cache_limit = self.CACHE_LIMIT if cache_limit is None else max(0, int(cache_limit))
+        self.frontier_limit = max(0, int(frontier_limit))
 
         self._db: Optional[aiosqlite.Connection] = None
         self._seen: "OrderedDict[str, None]" = OrderedDict()
@@ -178,6 +180,15 @@ class DomainStore:
         ):
             if column not in existing:
                 await self._db.execute(ddl)
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS frontier (
+                fingerprint TEXT PRIMARY KEY,
+                origin      TEXT,
+                added       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS domain_tech (
@@ -418,6 +429,72 @@ class DomainStore:
             path = os.path.join(self.output_dir, f"{name}.txt")
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write("\n".join(domains) + "\n")
+
+    # --------------------------------------------------------------- frontier
+    async def push_frontier(self, fingerprints: Sequence[str], origin: str = "") -> int:
+        """Queue self-discovered candidates for a later cycle.
+
+        Anything already stored is dropped, so the frontier only ever holds
+        work that still needs doing.
+        """
+        if self._db is None or not fingerprints:
+            return 0
+        unique = [fp for fp in dict.fromkeys(fingerprints) if fp and not self.is_known(fp)]
+        if not unique:
+            return 0
+        if len(unique) > self.frontier_limit:
+            unique = unique[: self.frontier_limit]
+        try:
+            await self._db.executemany(
+                "INSERT OR IGNORE INTO frontier (fingerprint, origin) "
+                "SELECT ?, ? WHERE NOT EXISTS "
+                "(SELECT 1 FROM domains WHERE fingerprint = ?)",
+                [(fp, origin, fp) for fp in unique],
+            )
+            await self._db.commit()
+        except Exception:
+            return 0
+        return len(unique)
+
+    async def take_frontier(self, limit: int) -> List[str]:
+        """Remove and return up to *limit* queued candidates."""
+        if self._db is None or limit <= 0:
+            return []
+        async with self._db.execute(
+            "SELECT fingerprint FROM frontier ORDER BY added ASC LIMIT ?", (int(limit),)
+        ) as cursor:
+            rows = [row[0] async for row in cursor]
+        if not rows:
+            return []
+        placeholders = ",".join("?" * len(rows))
+        await self._db.execute(
+            f"DELETE FROM frontier WHERE fingerprint IN ({placeholders})", rows
+        )
+        await self._db.commit()
+        return rows
+
+    async def frontier_size(self) -> int:
+        if self._db is None:
+            return 0
+        async with self._db.execute("SELECT COUNT(*) FROM frontier") as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def trim_frontier(self) -> int:
+        """Drop the oldest entries once the frontier exceeds its limit."""
+        if self._db is None:
+            return 0
+        size = await self.frontier_size()
+        excess = size - self.frontier_limit
+        if excess <= 0:
+            return 0
+        await self._db.execute(
+            "DELETE FROM frontier WHERE fingerprint IN "
+            "(SELECT fingerprint FROM frontier ORDER BY added ASC LIMIT ?)",
+            (excess,),
+        )
+        await self._db.commit()
+        return excess
 
     # ---------------------------------------------------------------- queries
     async def stale_domains(self, older_than_seconds: int, limit: int = 100) -> List[str]:
