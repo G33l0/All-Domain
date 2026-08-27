@@ -1,17 +1,8 @@
 """Run the collector on a private event loop in a background thread.
 
-Tkinter is not thread safe and asyncio is not Tk-loop friendly, so the two are
-kept strictly apart:
-
-* the engine runs on its own loop inside :class:`CollectorThread`;
-* control calls (start/pause/resume/stop) are marshalled onto that loop with
-  ``call_soon_threadsafe``;
-* events travel back through a plain ``queue.Queue`` that the GUI drains from
-  its own ``after()`` timer.
-
-The 1.x GUI called Tk widget methods directly from the asyncio thread, which is
-the classic source of random freezes and ``RuntimeError: main thread is not in
-main loop`` crashes.
+Control calls are marshalled onto that loop with ``call_soon_threadsafe``;
+events travel back through a ``queue.Queue`` that the UI drains on its own
+timer. No UI object is touched from the collector thread.
 """
 
 from __future__ import annotations
@@ -26,7 +17,7 @@ from .engine import Collector, Event, Stats
 
 
 class CollectorThread:
-    """Thread-safe façade around :class:`~domaincollector.engine.Collector`."""
+    """Thread-safe façade around :class:`~domainatlas.engine.Collector`."""
 
     def __init__(self, config: Config, max_events: int = 10000) -> None:
         self.config = config

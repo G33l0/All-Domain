@@ -5,6 +5,7 @@ domains.db-shm
 output/
 .cache/
 config.json
+*.part
 
 # Python
 __pycache__/

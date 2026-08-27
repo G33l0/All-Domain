@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 import pytest_asyncio
 
-from domaincollector.store import DomainRecord, DomainStore, safe_filename
+from domainatlas.store import DomainRecord, DomainStore, safe_filename
 
 pytestmark = pytest.mark.asyncio
 
@@ -227,3 +227,153 @@ async def test_legacy_rows_without_checked_at_are_stale(tmp_path):
         assert await store.stale_domains(3600, 10) == ["old.com"]
     finally:
         await store.close()
+
+
+async def test_buffered_records_survive_a_lost_connection(tmp_path):
+    """flush() must not drop the buffer when there is nothing to write to."""
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    connection, store._db = store._db, None
+    try:
+        await store.add(DomainRecord("keep.example", "keep.example", True, []))
+        assert await store.flush() == 0
+        assert [record.fingerprint for record in store._pending] == ["keep.example"]
+    finally:
+        store._db = connection
+        store._pending.clear()
+        await store.close()
+
+
+async def test_duplicates_are_rejected_beyond_the_cache(tmp_path):
+    """Dedup stays exact when a domain has aged out of the memory cache."""
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"), cache_limit=2)
+    await store.open()
+    try:
+        for index in range(5):
+            await store.add(DomainRecord(f"d{index}.example", f"d{index}.example", True, []))
+        await store.flush()
+        assert len(store._seen) <= 2          # cache is bounded
+        assert store.known_count == 5         # but the count is the real total
+
+        fresh = await store.filter_new(["d0.example", "d4.example", "new.example"])
+        assert fresh == ["new.example"]
+    finally:
+        await store.close()
+
+
+async def test_filter_new_deduplicates_within_a_batch(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        assert await store.filter_new(["a.example", "a.example", "b.example"]) == [
+            "a.example", "b.example",
+        ]
+    finally:
+        await store.close()
+
+
+async def test_cache_is_warmed_from_the_database(tmp_path):
+    path = str(tmp_path / "d.db")
+    first = DomainStore(path, str(tmp_path / "out"))
+    await first.open()
+    await first.add(DomainRecord("warm.example", "warm.example", True, []))
+    await first.close()
+
+    second = DomainStore(path, str(tmp_path / "out"))
+    await second.open()
+    try:
+        assert second.is_known("warm.example")
+        assert second.known_count == 1
+    finally:
+        await second.close()
+
+
+async def test_undated_rows_are_backfilled_on_open(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE domains (fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL, "
+            "first_seen TIMESTAMP, responsive BOOLEAN DEFAULT 0, technologies TEXT)"
+        )
+        conn.execute("INSERT INTO domains (fingerprint, raw, first_seen) VALUES (?,?,NULL)",
+                     ("undated.example", "undated.example"))
+        conn.commit()
+
+    store = DomainStore(path, str(tmp_path / "out"))
+    await store.open()
+    await store.close()
+
+    with sqlite3.connect(path) as conn:
+        stamp = conn.execute(
+            "SELECT first_seen FROM domains WHERE fingerprint = 'undated.example'"
+        ).fetchone()[0]
+    assert stamp is not None
+
+
+async def test_frontier_round_trip(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        assert await store.push_frontier(["a.example", "b.example"], origin="seed.example") == 2
+        assert await store.frontier_size() == 2
+
+        taken = await store.take_frontier(1)
+        assert len(taken) == 1
+        assert await store.frontier_size() == 1
+
+        rest = await store.take_frontier(10)
+        assert len(rest) == 1
+        assert await store.take_frontier(10) == []
+    finally:
+        await store.close()
+
+
+async def test_frontier_skips_domains_already_stored(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        await store.add(DomainRecord("known.example", "known.example", True, []))
+        await store.flush()
+        assert await store.push_frontier(["known.example", "fresh.example"]) == 1
+        assert await store.take_frontier(10) == ["fresh.example"]
+    finally:
+        await store.close()
+
+
+async def test_frontier_deduplicates(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
+    await store.open()
+    try:
+        await store.push_frontier(["x.example", "x.example"])
+        await store.push_frontier(["x.example"])
+        assert await store.frontier_size() == 1
+    finally:
+        await store.close()
+
+
+async def test_frontier_is_bounded(tmp_path):
+    store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"), frontier_limit=3)
+    await store.open()
+    try:
+        await store.push_frontier([f"d{i}.example" for i in range(10)])
+        assert await store.frontier_size() <= 3
+        await store.push_frontier([f"e{i}.example" for i in range(10)])
+        assert await store.trim_frontier() >= 0
+        assert await store.frontier_size() <= 3
+    finally:
+        await store.close()
+
+
+async def test_frontier_survives_a_restart(tmp_path):
+    path = str(tmp_path / "d.db")
+    first = DomainStore(path, str(tmp_path / "out"))
+    await first.open()
+    await first.push_frontier(["persist.example"], origin="seed")
+    await first.close()
+
+    second = DomainStore(path, str(tmp_path / "out"))
+    await second.open()
+    try:
+        assert await second.take_frontier(10) == ["persist.example"]
+    finally:
+        await second.close()

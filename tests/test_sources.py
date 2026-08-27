@@ -4,8 +4,8 @@ import zipfile
 
 import pytest
 
-from domaincollector.config import Config
-from domaincollector.sources import (
+from domainatlas.config import Config
+from domainatlas.sources import (
     CrtShSource,
     SeedFileSource,
     SourceError,
@@ -89,7 +89,10 @@ async def test_seed_file_missing_raises(tmp_path):
 
 
 def test_build_sources_defaults():
-    assert [source.name for source in build_sources(Config())] == ["crtsh", "tranco", "umbrella"]
+    """Self-sufficient sources lead; the third-party lists are the fallback."""
+    names = [source.name for source in build_sources(Config())]
+    assert names[:2] == ["self", "ctlog"]
+    assert "tranco" in names
 
 
 def test_build_sources_rejects_unknown_name():

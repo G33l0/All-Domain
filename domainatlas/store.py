@@ -1,14 +1,9 @@
-"""Persistence layer: SQLite database plus per-technology text files.
+"""Persistence: SQLite database plus per-technology text files.
 
-Design notes
-------------
-* One long-lived ``aiosqlite`` connection is used instead of opening a new
-  connection per domain (the 1.x behaviour), which was both slow and a source
-  of ``database is locked`` errors under concurrency.
-* WAL journalling and a busy timeout make concurrent readers safe.
-* Writes are batched by a background task and flushed with ``executemany``.
-* ``reserve()`` claims a fingerprint in memory before it is queued so the same
-  domain can never be probed twice by two workers.
+A single long-lived connection runs in WAL mode with a busy timeout, so readers
+never block the writer. Writes are batched by a background task and flushed
+with ``executemany``. ``reserve()`` claims a fingerprint before it is queued so
+no domain is probed twice.
 """
 
 from __future__ import annotations
@@ -18,6 +13,7 @@ import json
 import os
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -65,6 +61,11 @@ class DomainRecord:
 class DomainStore:
     """Async SQLite-backed store with in-memory deduplication."""
 
+    #: Fingerprints kept in memory for fast duplicate rejection. Beyond this
+    #: the store falls back to querying SQLite, so a large inventory does not
+    #: hold the whole key space in RAM.
+    CACHE_LIMIT = 250_000
+
     def __init__(
         self,
         db_path: str = "domains.db",
@@ -72,15 +73,20 @@ class DomainStore:
         write_tech_files: bool = True,
         flush_size: int = 50,
         flush_interval: float = 1.0,
+        cache_limit: Optional[int] = None,
+        frontier_limit: int = 500_000,
     ) -> None:
         self.db_path = db_path
         self.output_dir = output_dir
         self.write_tech_files = write_tech_files
         self.flush_size = max(1, int(flush_size))
         self.flush_interval = max(0.05, float(flush_interval))
+        self.cache_limit = self.CACHE_LIMIT if cache_limit is None else max(0, int(cache_limit))
+        self.frontier_limit = max(0, int(frontier_limit))
 
         self._db: Optional[aiosqlite.Connection] = None
-        self._seen: Set[str] = set()
+        self._seen: "OrderedDict[str, None]" = OrderedDict()
+        self._stored_count = 0
         self._reserved: Set[str] = set()
         self._pending: List[DomainRecord] = []
         self._flush_lock = asyncio.Lock()
@@ -102,8 +108,19 @@ class DomainStore:
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.execute("PRAGMA busy_timeout=10000")
         await self._migrate()
-        async with self._db.execute("SELECT fingerprint FROM domains") as cursor:
-            self._seen = {row[0] async for row in cursor}
+        async with self._db.execute("SELECT COUNT(*) FROM domains") as cursor:
+            row = await cursor.fetchone()
+        self._stored_count = int(row[0]) if row else 0
+        # Warm the cache with the most recent rows rather than every row: the
+        # database itself is the source of truth for duplicates.
+        self._seen.clear()
+        if self.cache_limit:
+            async with self._db.execute(
+                "SELECT fingerprint FROM domains ORDER BY first_seen DESC LIMIT ?",
+                (self.cache_limit,),
+            ) as cursor:
+                async for row in cursor:
+                    self._seen[row[0]] = None
         self._closed = False
         self._flusher = asyncio.create_task(self._flush_loop(), name="store-flusher")
         return self
@@ -165,6 +182,15 @@ class DomainStore:
                 await self._db.execute(ddl)
         await self._db.execute(
             """
+            CREATE TABLE IF NOT EXISTS frontier (
+                fingerprint TEXT PRIMARY KEY,
+                origin      TEXT,
+                added       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await self._db.execute(
+            """
             CREATE TABLE IF NOT EXISTS domain_tech (
                 fingerprint TEXT NOT NULL,
                 technology  TEXT NOT NULL,
@@ -179,15 +205,72 @@ class DomainStore:
                 tech_columns.add(row[1])
         if "version" not in tech_columns:
             await self._db.execute("ALTER TABLE domain_tech ADD COLUMN version TEXT")
-        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_domains_responsive ON domains(responsive)")
-        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_domain_tech_tech ON domain_tech(technology)")
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_domains_responsive ON domains(responsive)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_source ON domains(source)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_first_seen ON domains(first_seen, fingerprint)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_checked_at ON domains(checked_at)",
+            "CREATE INDEX IF NOT EXISTS idx_domain_tech_tech ON domain_tech(technology)",
+        ):
+            await self._db.execute(statement)
+        # Rows written before first_seen had a default would otherwise need a
+        # slower NULL-aware ordering on every read.
+        await self._db.execute(
+            "UPDATE domains SET first_seen = COALESCE(checked_at, CURRENT_TIMESTAMP) "
+            "WHERE first_seen IS NULL"
+        )
         await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         await self._db.commit()
 
     # ------------------------------------------------------------ dedup logic
+    def _remember(self, fingerprint: str) -> None:
+        if not self.cache_limit:
+            return
+        self._seen[fingerprint] = None
+        self._seen.move_to_end(fingerprint)
+        while len(self._seen) > self.cache_limit:
+            self._seen.popitem(last=False)
+
     def is_known(self, fingerprint: str) -> bool:
-        """``True`` if the domain is already stored or already queued."""
+        """``True`` if the domain is cached as stored or already queued.
+
+        Only consults memory. Use :meth:`filter_new` to also rule out domains
+        that are in the database but no longer cached.
+        """
         return fingerprint in self._seen or fingerprint in self._reserved
+
+    async def filter_new(self, fingerprints: Sequence[str]) -> List[str]:
+        """Return the fingerprints that are neither queued nor already stored.
+
+        Candidates missing from the in-memory cache are checked against the
+        database in one statement, which keeps duplicate rejection exact
+        without holding every known fingerprint in RAM.
+        """
+        candidates: List[str] = []
+        seen_here: Set[str] = set()
+        for fingerprint in fingerprints:
+            if fingerprint in seen_here or self.is_known(fingerprint):
+                continue
+            seen_here.add(fingerprint)
+            candidates.append(fingerprint)
+        if not candidates or self._db is None:
+            return candidates
+
+        await self.flush()
+        known: Set[str] = set()
+        chunk_size = 400
+        for start in range(0, len(candidates), chunk_size):
+            chunk = candidates[start:start + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            async with self._db.execute(
+                f"SELECT fingerprint FROM domains WHERE fingerprint IN ({placeholders})",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    known.add(row[0])
+        for fingerprint in known:
+            self._remember(fingerprint)
+        return [fingerprint for fingerprint in candidates if fingerprint not in known]
 
     def reserve(self, fingerprint: str) -> bool:
         """Claim a fingerprint for processing.  ``False`` when already claimed."""
@@ -202,7 +285,8 @@ class DomainStore:
 
     @property
     def known_count(self) -> int:
-        return len(self._seen)
+        """Domains stored in the database, including those not cached."""
+        return self._stored_count
 
     # ---------------------------------------------------------------- writing
     async def add(self, record: DomainRecord) -> bool:
@@ -220,7 +304,8 @@ class DomainStore:
         if record.fingerprint in self._seen:
             self._reserved.discard(record.fingerprint)
             return False
-        self._seen.add(record.fingerprint)
+        self._remember(record.fingerprint)
+        self._stored_count += 1
         self._reserved.discard(record.fingerprint)
         self._pending.append(record)
         if len(self._pending) >= self.flush_size:
@@ -243,9 +328,10 @@ class DomainStore:
         async with self._flush_lock:
             if not self._pending:
                 return 0
-            batch, self._pending = self._pending, []
             if self._db is None:
+                # Keep the buffer intact; taking it here would drop the records.
                 return 0
+            batch, self._pending = self._pending, []
             # UTC, to match SQLite's CURRENT_TIMESTAMP default on first_seen
             # and the cutoff used by stale_domains().
             now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -343,6 +429,72 @@ class DomainStore:
             path = os.path.join(self.output_dir, f"{name}.txt")
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write("\n".join(domains) + "\n")
+
+    # --------------------------------------------------------------- frontier
+    async def push_frontier(self, fingerprints: Sequence[str], origin: str = "") -> int:
+        """Queue self-discovered candidates for a later cycle.
+
+        Anything already stored is dropped, so the frontier only ever holds
+        work that still needs doing.
+        """
+        if self._db is None or not fingerprints:
+            return 0
+        unique = [fp for fp in dict.fromkeys(fingerprints) if fp and not self.is_known(fp)]
+        if not unique:
+            return 0
+        if len(unique) > self.frontier_limit:
+            unique = unique[: self.frontier_limit]
+        try:
+            await self._db.executemany(
+                "INSERT OR IGNORE INTO frontier (fingerprint, origin) "
+                "SELECT ?, ? WHERE NOT EXISTS "
+                "(SELECT 1 FROM domains WHERE fingerprint = ?)",
+                [(fp, origin, fp) for fp in unique],
+            )
+            await self._db.commit()
+        except Exception:
+            return 0
+        return len(unique)
+
+    async def take_frontier(self, limit: int) -> List[str]:
+        """Remove and return up to *limit* queued candidates."""
+        if self._db is None or limit <= 0:
+            return []
+        async with self._db.execute(
+            "SELECT fingerprint FROM frontier ORDER BY added ASC LIMIT ?", (int(limit),)
+        ) as cursor:
+            rows = [row[0] async for row in cursor]
+        if not rows:
+            return []
+        placeholders = ",".join("?" * len(rows))
+        await self._db.execute(
+            f"DELETE FROM frontier WHERE fingerprint IN ({placeholders})", rows
+        )
+        await self._db.commit()
+        return rows
+
+    async def frontier_size(self) -> int:
+        if self._db is None:
+            return 0
+        async with self._db.execute("SELECT COUNT(*) FROM frontier") as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def trim_frontier(self) -> int:
+        """Drop the oldest entries once the frontier exceeds its limit."""
+        if self._db is None:
+            return 0
+        size = await self.frontier_size()
+        excess = size - self.frontier_limit
+        if excess <= 0:
+            return 0
+        await self._db.execute(
+            "DELETE FROM frontier WHERE fingerprint IN "
+            "(SELECT fingerprint FROM frontier ORDER BY added ASC LIMIT ?)",
+            (excess,),
+        )
+        await self._db.commit()
+        return excess
 
     # ---------------------------------------------------------------- queries
     async def stale_domains(self, older_than_seconds: int, limit: int = 100) -> List[str]:

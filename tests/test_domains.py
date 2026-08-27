@@ -1,6 +1,6 @@
 import pytest
 
-from domaincollector.domains import (
+from domainatlas.domains import (
     is_valid_domain,
     normalize_all,
     normalize_domain,

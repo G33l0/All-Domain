@@ -85,6 +85,11 @@ def normalize_domain(raw: object) -> Optional[str]:
     return encoded
 
 
+def is_onion(domain: str) -> bool:
+    """True for Tor hidden services, which need a SOCKS proxy to reach."""
+    return isinstance(domain, str) and domain.lower().endswith(".onion")
+
+
 def is_valid_domain(raw: object) -> bool:
     """``True`` when *raw* normalises to a usable domain name."""
     return normalize_domain(raw) is not None

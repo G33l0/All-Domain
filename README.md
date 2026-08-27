@@ -1,43 +1,51 @@
-# 🌐 Domain Collector
-
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python Version">
-  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/status-active-brightgreen" alt="Status">
-  <img src="https://img.shields.io/badge/tests-140%20passing-brightgreen" alt="Tests">
+  <img src="assets/logo.svg" alt="Domain Atlas" width="88">
 </p>
 
-> *Autonomous, asynchronous domain intelligence & technology fingerprinting framework*
+<h1 align="center">Domain Atlas</h1>
 
----
+<p align="center">
+  Asynchronous domain discovery, technology fingerprinting and inventory.
+</p>
 
-Domain Collector continuously discovers domains from public feeds, checks whether they
-answer over HTTP/HTTPS, fingerprints the technology stack behind them, and files the
-results into a SQLite database and technology-specific text files — with no duplicates.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/ui-PySide6%20%2F%20Qt%206-41cd52.svg" alt="PySide6">
+  <img src="https://img.shields.io/badge/tests-245%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT">
+</p>
 
-It runs either as a **desktop GUI** or **fully headless in a terminal**.
+<p align="center">
+  <img src="docs/screenshots/dashboard-midnight.png" alt="Domain Atlas dashboard" width="860">
+</p>
 
----
+Domain Atlas continuously discovers domains from public feeds, checks whether they
+respond over HTTP or HTTPS, identifies the technologies behind them, and keeps the
+results in a queryable SQLite inventory. It runs as a desktop application or headless
+from a terminal.
 
-## 🎯 What it does
+## Features
 
-- 🔍 **Discovers** domains from several public feeds — Certificate Transparency in real
-  time over a **certstream websocket**, crt.sh searches, the Tranco / Cisco Umbrella /
-  Majestic ranking lists, or your own seed file
-- ✅ **Validates** every candidate (punycode, label rules, TLD sanity, no IPs or wildcards)
-  before a single request is made
-- 🌐 **Probes** each domain over HTTPS, falling back to HTTP
-- 🧬 **Fingerprints** the stack — web servers, CDNs, CMSs, frameworks, JS libraries,
-  analytics, security headers — from response headers, cookies, `<meta>` tags and HTML,
-  including version numbers where they are exposed
-- 📁 **Writes** `output/<technology>.txt` in real time, one domain per line
-- 🔁 **Re-checks** stored domains on a schedule, so the dataset tracks stacks that change
-- 🛡️ **Deduplicates** in memory *and* in SQLite, so a domain is never probed or stored twice
-- ⚡ **Scales** with configurable concurrency and a bounded work queue
+- **Discovery that does not depend on a third party** — Certificate Transparency logs are
+  read directly over RFC 6962 from several independent operators, and every probe feeds
+  its own findings back into the queue. Aggregators and ranking lists are fallbacks, not
+  the foundation. Sources fail independently and are retried on a cooldown.
+- **Technology fingerprinting** — 70+ built-in rules covering web servers, CDNs, CMSs,
+  frameworks, JavaScript libraries, analytics and security headers, with version capture,
+  derived from response headers, cookies, meta tags and HTML.
+- **Deduplicated inventory** — a domain is probed once and stored once, enforced both in
+  memory and by the database schema.
+- **Scheduled re-checks** — stored domains can be re-probed on an interval, updating
+  their record in place rather than duplicating it.
+- **Tor support** — `.onion` addresses are discovered and stored on the clear web, and
+  probed through a SOCKS5 proxy when one is configured.
+- **Filtered export** — CSV, JSON, JSON Lines or plain domain lists, filtered by
+  technology, source, status, network or first-seen date, streamed from disk.
+- **Scales to large inventories** — the desktop table pages through a multi-million row
+  database with keyset pagination; every query runs off the UI thread.
+- **Six themes** — Light, Dark, Midnight, Aurora, Amber and a monospaced Hacker theme.
 
----
-
-## 📦 Installation
+## Installation
 
 ```bash
 git clone https://github.com/G33l0/All-Domain.git
@@ -45,247 +53,302 @@ cd All-Domain
 pip install -r requirements.txt
 ```
 
-Requirements: **Python 3.9+**, `aiohttp`, `aiosqlite`, `idna`.
+Requires Python 3.9 or newer. `PySide6` provides the desktop interface; without it the
+application falls back to a bundled Tk interface, or runs headless.
 
-The GUI additionally needs Tk, which some Python builds ship separately:
-
-```bash
-sudo apt install python3-tk      # Debian / Ubuntu
-sudo dnf install python3-tkinter # Fedora
-```
-
-Without Tk the collector still runs — it just goes straight to headless mode.
-
----
-
-## 🚀 Usage
+Optional extras:
 
 ```bash
-# Desktop GUI (falls back to headless if Tk is missing)
-python domain_collector.py
-
-# Headless, runs until you press Ctrl+C
-python domain_collector.py --headless
-
-# One fetch cycle of 100 domains, 50 at a time, then exit
-python domain_collector.py --headless --once --limit 100 --concurrency 50
-
-# Feed it your own list instead of the public sources
-python domain_collector.py --headless --sources file --seed-file my-domains.txt
-
-# Live Certificate Transparency stream (see the certstream note below)
-python domain_collector.py --headless --sources certstream \
-    --certstream-url ws://127.0.0.1:8080/domains-only
-
-# Discover new domains and re-check anything last seen over a day ago
-python domain_collector.py --headless --recheck-after 86400 --recheck-batch 200
-
-# Re-check only: refresh what is already stored, discover nothing new
-python domain_collector.py --headless --recheck-after 86400 --recheck-only
-
-# Inspect what has been collected so far
-python domain_collector.py --stats
-python domain_collector.py --export WordPress > wordpress-sites.txt
+pip install aiohttp-socks    # probe .onion services through Tor
+pip install pyinstaller      # build a Windows executable
 ```
 
-`Ctrl+C` stops gracefully: in-flight probes finish, buffered rows are flushed, the
-database and HTTP sessions are closed. Press it twice to force an immediate exit.
+On a minimal Linux container the Qt libraries need
+`libegl1 libgl1 libxkbcommon0 libdbus-1-3`; desktop installations already have them.
 
-### Command line options
+## Usage
+
+```bash
+python domain_atlas.py                          # desktop application
+python domain_atlas.py --ui qt --theme midnight # pick interface and theme
+python domain_atlas.py --headless               # terminal, Ctrl+C to stop
+python domain_atlas.py --headless --once --limit 100
+```
+
+Discovery and inventory:
+
+```bash
+# collect from specific sources
+python domain_atlas.py --headless --sources certstream,tranco,onion
+
+# re-check anything last seen more than a day ago
+python domain_atlas.py --headless --recheck-after 86400 --recheck-batch 200
+
+# refresh stored records only, discover nothing new
+python domain_atlas.py --headless --recheck-after 86400 --recheck-only
+
+# probe Tor hidden services through a local Tor daemon
+python domain_atlas.py --headless --sources onion --tor-proxy socks5://127.0.0.1:9050
+```
+
+Reporting and export:
+
+```bash
+python domain_atlas.py --stats
+
+python domain_atlas.py --export wordpress.csv --filter-technology WordPress --filter-live
+python domain_atlas.py --export onions.jsonl --filter-onion
+python domain_atlas.py --export - --filter-source certstream --filter-since 2026-01-01
+```
+
+### Command line reference
 
 | Option | Description |
-|---|---|
-| `--headless`, `--no-gui` | Run in the terminal instead of opening the GUI |
-| `--once` / `--cycles N` | Stop after one / N fetch cycles |
+| --- | --- |
+| `--headless`, `--no-gui` | Run in the terminal instead of the desktop application |
+| `--ui {auto,qt,tk}` | Interface to use |
+| `--theme NAME` | `system`, `light`, `dark`, `midnight`, `aurora`, `amber`, `hacker` |
+| `--once`, `--cycles N` | Stop after one or N fetch cycles |
 | `--concurrency N` | Simultaneous probes (default 20) |
 | `--timeout SECONDS` | Per-request timeout (default 10) |
 | `--interval SECONDS` | Delay between fetch cycles (default 1800) |
-| `--limit N` | Max domains queued per cycle (default 500) |
-| `--sources LIST` | `crtsh`, `certstream`, `tranco`, `umbrella`, `majestic`, `file` (comma separated) |
-| `--seed-file PATH` | Local file of candidate domains, one per line |
-| `--certstream-url URL` | Certstream websocket to stream CT logs from |
-| `--recheck-after SECONDS` | Re-probe stored domains older than this (`0` disables) |
-| `--recheck-batch N` | How many stale domains to re-queue per cycle |
-| `--recheck-only` | Refresh stored domains only, discover nothing new |
-| `--db PATH` / `--output DIR` | Database and technology-file locations |
-| `--responsive-only` | Store only domains that answered |
-| `--no-tech-files` | Database only, skip `output/*.txt` |
-| `--verify-ssl` | Verify TLS certificates (off by default — many live hosts have broken chains) |
-| `--use-builtwith` | Additionally run the optional legacy `builtwith` package |
-| `--stats` / `--export TECH` | Report on the database, then exit |
+| `--limit N` | Domains queued per cycle (default 500) |
+| `--sources LIST` | `self`, `ctlog`, `crtsh`, `certstream`, `tranco`, `umbrella`, `majestic`, `onion`, `file` |
+| `--seed-file PATH` | Local candidate list, one domain per line |
+| `--certstream-url URL` | Certstream websocket endpoint |
+| `--tor-proxy URL` | SOCKS5 proxy for `.onion` probing |
+| `--recheck-after SECONDS` | Re-probe records older than this (`0` disables) |
+| `--recheck-batch N`, `--recheck-only` | Re-check volume, and re-check without discovery |
+| `--db PATH`, `--output DIR` | Database and technology-file locations |
+| `--responsive-only`, `--no-tech-files` | Storage behaviour |
+| `--verify-ssl` | Verify TLS certificates (off by default) |
+| `--stats` | Print inventory statistics and exit |
+| `--export PATH` | Export and exit; `-` writes to standard output |
+| `--export-format` | `csv`, `json`, `jsonl`, `txt` (default: from the file extension) |
+| `--filter-technology`, `--filter-source`, `--filter-contains`, `--filter-since` | Export filters |
+| `--filter-live`, `--filter-down`, `--filter-onion`, `--filter-clearnet` | Export filters |
 | `--save-config` | Write the resulting settings to the config file and exit |
-| `-c`, `--config PATH` | Config file to use (default `config.json`) |
 
----
+## Desktop application
 
-## ⚙️ Configuration
+<p align="center">
+  <img src="docs/screenshots/domains.png" alt="Domains view" width="860">
+</p>
 
-Settings live in `config.json` (created by `--save-config` or by the GUI's **Settings**
-dialog). Command line flags override the file for a single run.
+Built with PySide6 (Qt 6) and styled to match Windows 11, with identical rendering on
+Linux and macOS.
+
+- **Dashboard** — live counters, a rolling feed of recent results, and a ranked
+  technology breakdown.
+- **Domains** — the full inventory with search, technology, source, status and network
+  filters. Rows load a page at a time as the table is scrolled.
+- **Technologies** — every detected technology with its share of the inventory.
+- **Activity log** — colour-coded, bounded, and saveable to a file.
+- **Settings** — every option with validation, persisted to `config.json`.
+
+All database work happens on a worker thread, so filtering or scrolling a large
+inventory never blocks the interface.
+
+### Display scaling
+
+The interface is verified at every Windows scaling level from 100% to 225%.
+Panels reflow into fewer columns as the window narrows, the toolbar drops its
+labels, captions elide rather than forcing the window wider, and the Settings
+page scrolls. The window can shrink to 820x460 logical pixels, which fits a
+1920x1080 display at 200% scaling (960x540 logical) and any 4K display up to
+300%.
+
+<p align="center">
+  <img src="docs/screenshots/dashboard-200-percent.png" alt="Domain Atlas at 200% display scaling" width="760">
+</p>
+
+### Themes
+
+| | | |
+| --- | --- | --- |
+| ![Light](docs/screenshots/dashboard-light.png) | ![Dark](docs/screenshots/dashboard-dark.png) | ![Midnight](docs/screenshots/dashboard-midnight.png) |
+| Light | Dark | Midnight |
+| ![Aurora](docs/screenshots/dashboard-aurora.png) | ![Amber](docs/screenshots/dashboard-amber.png) | ![Hacker](docs/screenshots/dashboard-hacker.png) |
+| Aurora | Amber | Hacker |
+
+The theme follows the operating system by default and can be changed from the sidebar.
+
+### Building a Windows executable
+
+```powershell
+pip install pyinstaller PySide6
+python packaging/make_icons.py
+pyinstaller packaging/domain-atlas.spec
+```
+
+Produces `dist/DomainAtlas.exe`, a single file with no console window. The same binary
+accepts `--headless` for command line use.
+
+## Configuration
+
+Settings live in `config.json`, created by `--save-config` or by the Settings page.
+Command line flags override the file for a single run, and every value is range-checked
+on load.
 
 | Key | Default | Description |
-|---|---|---|
-| `concurrency` | `20` | Simultaneous HTTP probes |
-| `http_timeout` | `10` | Timeout in seconds for each request |
+| --- | --- | --- |
+| `concurrency` | `20` | Simultaneous probes |
+| `http_timeout` | `10` | Per-request timeout in seconds |
 | `fetch_interval` | `1800` | Seconds between fetch cycles |
 | `max_queue_size` | `10000` | Bounded in-memory work queue |
-| `max_domains_per_cycle` | `500` | How many candidates to queue per cycle |
-| `max_body_bytes` | `262144` | Hard cap on how much HTML is downloaded per domain |
-| `db_path` | `domains.db` | SQLite database |
-| `output_dir` | `output` | Technology text files |
-| `cache_dir` | `.cache` | Cached ranking lists and feed positions |
-| `sources` | `["crtsh","tranco","umbrella"]` | Enabled feeds, tried in order |
-| `seed_file` | `null` | Optional local candidate list |
-| `certstream_url` | `wss://certstream.calidog.io/domains-only` | Certstream websocket |
-| `certstream_buffer` | `20000` | Streamed domains held between cycles |
-| `certstream_wait` | `15` | Seconds a fetch waits for the stream to produce names |
-| `recheck_after` | `0` | Re-probe domains older than this many seconds (`0` = off) |
-| `recheck_batch` | `100` | Stale domains re-queued per cycle |
-| `recheck_only` | `false` | Skip discovery, re-check stored domains only |
+| `max_domains_per_cycle` | `500` | Candidates queued per cycle |
+| `max_body_bytes` | `262144` | Maximum HTML downloaded per domain |
+| `db_path` | `domains.db` | SQLite inventory |
+| `output_dir` | `output` | Per-technology text files |
+| `cache_dir` | `.cache` | Cached source lists and read positions |
+| `sources` | `self, ctlog, tranco, umbrella` | Enabled feeds, budget shared evenly |
+| `ct_logs` | *(built-in list)* | Certificate Transparency logs to read |
+| `expand_from_html` | `true` | Queue host names linked from fetched pages |
+| `expand_from_certificates` | `true` | Queue host names from probed TLS certificates |
+| `frontier_limit` | `500000` | Cap on self-discovered candidates held for later |
+| `certstream_url` | `wss://certstream.calidog.io/domains-only` | Certificate Transparency stream |
+| `onion_index_url` | `https://ahmia.fi/onions/` | Public hidden-service index |
+| `tor_proxy` | *(empty)* | SOCKS5 proxy for `.onion` probing |
+| `recheck_after` | `0` | Re-probe records older than this (`0` disables) |
+| `recheck_batch` | `100` | Stale records re-queued per cycle |
+| `recheck_only` | `false` | Skip discovery and only refresh stored records |
 | `verify_ssl` | `false` | Verify TLS certificates |
 | `write_tech_files` | `true` | Write `output/<technology>.txt` |
-| `store_unresponsive` | `true` | Keep unreachable domains in the database |
-| `use_builtwith` | `false` | Also run the optional `builtwith` package |
+| `store_unresponsive` | `true` | Keep unreachable domains in the inventory |
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
-Every value is range-checked on load — a bad config is reported clearly instead of
-crashing the collector mid-run.
+## Discovery without a dependency
+
+Two of the sources need no third-party service, and they are the defaults.
+
+**`ctlog` reads Certificate Transparency directly.** crt.sh and certstream are
+aggregators sitting on top of the CT ecosystem, and they are the usual point of failure —
+crt.sh returns HTTP 502 for days at a time, and the public certstream endpoint accepts
+connections then streams nothing. The logs themselves are a public append-only protocol
+(RFC 6962) served by the operators: Cloudflare, DigiCert, Sectigo, Google, Let's Encrypt.
+Domain Atlas rotates across them, checkpoints its read position per log so a restart
+resumes rather than replays, and parses certificates with a small DER scan rather than a
+cryptography dependency. One operator returning 5xx costs nothing; the others carry the
+cycle.
+
+**`self` recycles the collector's own findings.** Every probe already downloads a page and
+completes a TLS handshake, and both name further hosts. Those host names are normalised
+and queued in the database, so the source needs no network of its own. In practice each
+probe yields more than one new candidate, so the queue grows faster than it drains: seed
+the collector once and it keeps working with every external feed offline. The frontier is
+persistent, so a restart resumes with a backlog rather than an empty queue.
+
+```bash
+# no aggregator, no ranking list
+python domain_atlas.py --headless --sources ctlog
+
+# no network source at all, running purely off what it found before
+python domain_atlas.py --headless --sources self
+```
 
 ---
 
-## 📁 Output
+## Architecture
 
 ```
-All-Domain/
-├── domains.db          # every domain, with status, versions, timings and source
-├── output/             # one file per detected technology
-│   ├── Nginx.txt
-│   ├── WordPress.txt
-│   └── React.txt
-├── .cache/             # cached ranking lists + per-source read positions
-└── config.json         # your settings
+domainatlas/
+  cli.py        command line entry point and argument handling
+  config.py     validated settings, loaded from and saved to JSON
+  ctlog.py      Certificate Transparency reading and certificate parsing
+  domains.py    parsing, validation and normalisation of host names
+  engine.py     producer/consumer collection loop
+  sources.py    discovery feeds and the source registry
+  tech.py       technology fingerprint rules
+  store.py      batched SQLite writes and per-technology files
+  query.py      read-only paged queries and filters
+  export.py     streaming CSV/JSON/JSONL/TXT export
+  runner.py     background thread wrapper for the interfaces
+  gui.py        Tk fallback interface
+  qtui/         PySide6 desktop application
 ```
 
-The database keeps more than the text files do:
+A producer resolves candidates from each source, normalises them
+(`https://Example.COM:8443/x` → `example.com`, `*.a.b.com` → `a.b.com`, IDN to punycode)
+and rejects anything that is not a routable host name. New fingerprints are reserved in
+memory and queued. Consumers probe HTTPS, then HTTP, read at most `max_body_bytes` of the
+response and fingerprint it. Results are batched into SQLite in WAL mode and appended to
+the technology files.
+
+Reads never touch the write path: `query.py` opens its own read-only connection and pages
+with keyset pagination, so page 10,000 costs the same as page 1.
+
+### Data model
 
 ```sql
--- domains:     fingerprint, raw, first_seen, responsive, technologies (JSON),
---              status_code, scheme, error, elapsed_ms, source, checked_at
+-- domains:     fingerprint, raw, first_seen, responsive, technologies, status_code,
+--              scheme, error, elapsed_ms, source, checked_at
 -- domain_tech: fingerprint, technology, version
+
 SELECT technology, COUNT(*) FROM domain_tech GROUP BY technology ORDER BY 2 DESC;
 ```
 
-Databases written by version 1.x are migrated automatically on first open.
+Databases written by earlier versions are migrated automatically on first open.
 
----
+### Adding a source
 
-## 📡 Live Certificate Transparency (certstream)
+Subclass `Source` and register it:
 
-The `certstream` source holds a **persistent websocket** to a
-[certstream-server](https://github.com/d-Rickyy-b/certstream-server-go) and buffers every
-name it sees; each cycle drains the buffer. It understands both message shapes — the full
-`certificate_update` payload and the lighter `domains-only` feed — ignores heartbeats,
-strips wildcards, and reconnects with exponential backoff if the server hangs up.
+```python
+from domainatlas.sources import Source, register_source
 
-> ⚠️ **The public `certstream.calidog.io` server accepts connections but is frequently
-> idle** — it will connect and then send nothing. When that happens the source reports
-> `no certificates received`, goes on cooldown, and the other configured sources carry the
-> cycle. For a dependable live feed, run your own certstream-server-go and point
-> `--certstream-url` at it.
+@register_source
+class MyFeed(Source):
+    name = "my-feed"
 
----
-
-## 🔁 Re-check scheduling
-
-Domains are probed once when discovered. Set `recheck_after` and the producer also
-re-queues rows whose `checked_at` is older than that, oldest first, `recheck_batch` per
-cycle:
-
-```bash
-python domain_collector.py --headless --recheck-after 86400   # daily refresh
-python domain_collector.py --headless --recheck-after 604800 --recheck-only
+    async def fetch(self, session, limit):
+        async with session.get("https://example.com/domains.txt") as response:
+            body = await response.text()
+        return body.split()[:limit]
 ```
 
-A re-check **updates the existing row in place** — status, technologies, timing and
-`checked_at` — rather than inserting a duplicate. Technologies that disappeared are
-removed rather than merged, and a domain is never appended twice to the same
-`output/<technology>.txt`. Rows written by the 1.x collector have no `checked_at`, so they
-fall back to `first_seen` and are refreshed first.
+Third-party packages can register sources without modifying the codebase by advertising
+them on the `domain_atlas.sources` entry point group:
 
----
+```toml
+[project.entry-points."domain_atlas.sources"]
+my-feed = "mypackage.feeds:MyFeed"
+```
 
-## 🧠 How it works
-
-1. **Producer** re-queues any domains due for a re-check, then asks each configured
-   source for new candidates. A source that fails
-   (crt.sh regularly returns HTTP 502) is put on an escalating cooldown while the
-   others carry on — one dead feed never stops the run.
-2. Candidates are **normalised** (`https://Example.COM:8443/x` → `example.com`,
-   `*.a.b.com` → `a.b.com`, IDN → punycode) and rejected if they are not real domains.
-3. Each new fingerprint is **reserved** in memory and pushed onto a bounded queue.
-4. **Consumers** probe HTTPS, then HTTP, reading at most `max_body_bytes` of the body,
-   and fingerprint the response headers, cookies, meta tags and HTML.
-5. Results are **batched** into SQLite (WAL mode, `executemany`) and appended to the
-   technology files.
-6. The producer sleeps for `fetch_interval` and goes again — interruptibly.
-
-The ranking lists are cached on disk for 24 hours and read a window at a time, so each
-cycle brings *new* domains rather than re-probing the same first N entries.
-
----
-
-## 🖥️ The GUI
-
-- Start / Pause / Resume / Stop, with buttons that enable and disable to match the state
-- Live counters: processed, responsive, unreachable, new, re-checked, queue depth, probes/s
-- Live technology table and a colour-coded activity log (capped so it cannot eat memory)
-- **Settings** dialog (concurrency, timeouts, sources, certstream URL, re-check schedule)
-  that validates input and persists to `config.json`
-- **Export** button for the activity log
-- Closing the window stops collection cleanly instead of killing it mid-write
-
-The engine runs on its own event loop in a worker thread and communicates with Tk through
-a queue — no widget is ever touched from a background thread.
-
----
-
-## 🧪 Tests
+## Tests
 
 ```bash
 pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-140 tests cover domain normalisation, technology detection, the store (including 1.x
-database migration and re-check updates), source parsing and caching, certstream against a
-local websocket server, the threaded runner, the CLI, and full producer/consumer cycles
-against a real local HTTP server.
+245 tests cover normalisation, fingerprinting, storage and migration, source parsing and
+caching, certstream against a local websocket server, the query and export layers, the
+threaded runner, the command line, and the desktop interface. Qt tests run on the
+offscreen platform and are skipped when PySide6 is unavailable.
 
----
+## Scope and limits
 
-## 🛡️ Ethical considerations
+- No source enumerates the entire DNS namespace, and Domain Atlas does not claim to.
+  Certificate Transparency covers any host that has ever been issued a TLS certificate,
+  which is the broadest practical view available, and self-expansion reaches whatever
+  those hosts link to. Coverage grows with the number of configured sources and how long
+  the collector runs.
+- Hidden services are discovered from public clear-web indexes. Probing them requires a
+  running Tor daemon and `aiohttp-socks`; without those, `.onion` records are stored and
+  exportable but marked as unprobed.
+- The public `certstream.calidog.io` endpoint accepts connections but is frequently idle.
+  Point `certstream_url` at a self-hosted
+  [certstream-server-go](https://github.com/d-Rickyy-b/certstream-server-go) for a
+  dependable live feed.
 
-- **Public sources only.** Certificate Transparency logs and published ranking lists.
-- **Be polite.** `concurrency` is yours to tune; `limit_per_host` is capped at 4 and each
-  domain is requested at most twice (HTTPS, then HTTP). No content scraping, no crawling
-  beyond the landing page, no brute forcing.
-- **Legal use.** Security research, technology-adoption analysis, and public dataset
-  building. Do not use it to attack or probe systems you are not authorised to test.
+## Responsible use
 
----
+Domain Atlas reads public data sources and issues at most two HTTP requests per domain to
+its landing page. It does not crawl, brute force or fetch content beyond that. Concurrency
+is configurable and the caller is responsible for setting it appropriately. Use it for
+security research, technology adoption analysis and asset inventory, and only against
+systems you are authorised to assess.
 
-## 🤝 Contributing
+## License
 
-Adding a source is a subclass of `Source` in `domaincollector/sources.py` plus an entry in
-`SOURCE_CLASSES`. Adding a fingerprint is one `Rule` in `domaincollector/tech.py`. Please
-run `python -m pytest` before opening a pull request.
-
----
-
-## 📄 License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
-Happy Recon! – IamG2ont
+MIT. See [LICENSE](LICENSE).

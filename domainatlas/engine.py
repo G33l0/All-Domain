@@ -1,15 +1,9 @@
-"""The asynchronous collection engine.
+"""Asynchronous collection engine.
 
-Responsibilities
-----------------
-* one producer that pulls candidate domains from the configured sources, with
-  per-source failure tracking and cooldowns;
-* N consumers that probe each domain over HTTPS then HTTP and fingerprint the
-  response;
-* a stats object and an event stream that any front-end (GUI or CLI) can
-  consume without touching engine internals;
-* deterministic, graceful shutdown - every task cancelled, every session and
-  the database closed, every buffered write flushed.
+A producer pulls candidates from the configured sources, tracking per-source
+failures and cooldowns. Consumers probe each domain over HTTPS then HTTP and
+fingerprint the response. Progress is published as events for any front-end to
+consume. Shutdown cancels every task and closes every session and the database.
 """
 
 from __future__ import annotations
@@ -26,9 +20,10 @@ import aiohttp
 
 from . import tech as tech_module
 from .config import Config
-from .domains import normalize_domain
+from .ctlog import dns_names
+from .domains import is_onion, normalize_domain
 from .httputil import read_capped
-from .sources import Source, SourceError, build_sources
+from .sources import Source, SourceEmpty, SourceError, build_sources
 from .store import DomainRecord, DomainStore
 
 EventCallback = Callable[["Event"], None]
@@ -51,6 +46,8 @@ class Stats:
     new: int = 0
     duplicates: int = 0
     rechecked: int = 0
+    #: Host names harvested from probed pages and certificates.
+    discovered: int = 0
     unreachable: int = 0
     errors: int = 0
     cycles: int = 0
@@ -77,6 +74,7 @@ class Stats:
             "new": self.new,
             "duplicates": self.duplicates,
             "rechecked": self.rechecked,
+            "discovered": self.discovered,
             "unreachable": self.unreachable,
             "errors": self.errors,
             "cycles": self.cycles,
@@ -97,6 +95,33 @@ class ProbeResult:
     versions: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
     elapsed_ms: int = 0
+    #: Host names seen in the page and certificate, for self-expansion.
+    discovered: List[str] = field(default_factory=list)
+
+
+class TorUnavailable(RuntimeError):
+    """Tor was requested but cannot be used; the message says why."""
+
+
+def tor_connector(config: Config):
+    """A SOCKS connector for reaching .onion services.
+
+    Raises :class:`TorUnavailable` with a specific reason rather than failing
+    silently: without it, .onion domains are still discovered and stored, they
+    are simply not probed. Must be called from inside a running event loop.
+    """
+    if not config.tor_proxy:
+        raise TorUnavailable("no tor_proxy configured")
+    try:
+        from aiohttp_socks import ProxyConnector
+    except ImportError as exc:
+        raise TorUnavailable(
+            "aiohttp-socks is not installed (pip install aiohttp-socks)"
+        ) from exc
+    try:
+        return ProxyConnector.from_url(config.tor_proxy, limit=max(4, config.concurrency))
+    except Exception as exc:
+        raise TorUnavailable(f"{config.tor_proxy}: {type(exc).__name__}: {exc}") from exc
 
 
 def _ssl_argument(config: Config):
@@ -134,6 +159,65 @@ async def _read_body(response: "aiohttp.ClientResponse", max_bytes: int) -> str:
         return raw.decode("utf-8", errors="ignore")
 
 
+#: Host names appearing in href/src attributes and bare URLs.
+_LINK_RE = re.compile(r"(?:https?:)?//([A-Za-z0-9._~-]{4,253})(?=[/\"'?:#\s>]|$)")
+
+#: Hosts that appear on nearly every page and add nothing to an inventory.
+_LINK_NOISE = frozenset({
+    "www.w3.org", "schema.org", "www.googletagmanager.com", "fonts.googleapis.com",
+    "fonts.gstatic.com", "www.google-analytics.com", "cdn.jsdelivr.net",
+    "cdnjs.cloudflare.com", "unpkg.com", "ajax.googleapis.com", "gmpg.org",
+})
+
+
+def hosts_in_html(html: str, limit: int = 60) -> List[str]:
+    """Host names linked from a page, for feeding discovery back on itself."""
+    if not html:
+        return []
+    found: List[str] = []
+    seen = set()
+    for match in _LINK_RE.finditer(html):
+        host = match.group(1).lower().rstrip(".")
+        if host in seen or host in _LINK_NOISE:
+            continue
+        seen.add(host)
+        found.append(host)
+        if len(found) >= limit:
+            break
+    return found
+
+
+def hosts_in_certificate(ssl_object) -> List[str]:
+    """Host names in the peer certificate of an open TLS connection.
+
+    The certificate is read in DER form so it works even when verification is
+    disabled, which is the default for reachability probing.
+    """
+    if ssl_object is None:
+        return []
+    try:
+        der = ssl_object.getpeercert(binary_form=True)
+    except (ValueError, AttributeError, OSError):
+        return []
+    if not der:
+        return []
+    try:
+        return dns_names(der)
+    except Exception:
+        return []
+
+
+def _peer_ssl_object(response: "aiohttp.ClientResponse"):
+    connection = getattr(response, "connection", None)
+    transport = getattr(connection, "transport", None)
+    if transport is None:
+        return None
+    try:
+        return transport.get_extra_info("ssl_object")
+    except Exception:
+        return None
+
+
 def _clean_error(exc: BaseException) -> str:
     """Short, readable one-line error text (aiohttp bakes SSLContext reprs in)."""
     message = str(exc).strip()
@@ -163,6 +247,12 @@ async def probe_domain(
             async with session.get(url, timeout=timeout, allow_redirects=True, ssl=ssl_arg) as response:
                 last_status = response.status
                 body = await _read_body(response, config.max_body_bytes)
+                discovered: List[str] = []
+                if config.expand_from_certificates and scheme == "https":
+                    discovered.extend(hosts_in_certificate(_peer_ssl_object(response)))
+                if config.expand_from_html:
+                    discovered.extend(hosts_in_html(body))
+
                 versions = tech_module.detect_versions(response.headers, body, url=str(response.url))
                 if config.use_builtwith:
                     extra = await asyncio.to_thread(
@@ -177,6 +267,7 @@ async def probe_domain(
                     scheme=scheme,
                     technologies=sorted(versions),
                     versions=versions,
+                    discovered=discovered,
                     error=None if response.status < 400 else f"HTTP {response.status}",
                     elapsed_ms=int((time.perf_counter() - started) * 1000),
                 )
@@ -218,7 +309,12 @@ class Collector:
         self.store = store or DomainStore(config.db_path, config.output_dir, config.write_tech_files)
         self._owns_store = store is None
         self._on_event = on_event
-        self.sources: List[Source] = list(sources) if sources is not None else build_sources(config)
+        if sources is not None:
+            self.sources: List[Source] = list(sources)
+        else:
+            # build_sources reads this to wire the self-expansion source.
+            setattr(config, "_store", self.store)
+            self.sources = build_sources(config)
         self.stats = Stats()
 
         self._queue: Optional[asyncio.Queue] = None
@@ -231,6 +327,7 @@ class Collector:
         self._pause_requested = False
         self._tasks: List[asyncio.Task] = []
         self._cooldowns: Dict[str, float] = {}
+        self._tor_session: Optional["aiohttp.ClientSession"] = None
         #: Domains queued for a re-check; they are already in the store, so
         #: store.reserve() cannot be used to keep them out of the queue twice.
         self._rechecking: set = set()
@@ -286,7 +383,7 @@ class Collector:
         try:
             self._on_event(event)
         except Exception:
-            # A broken front-end must never take the collector down.
+            # A front-end error must not stop collection.
             pass
 
     def _log(self, message: str, level: str = "INFO", **data: Any) -> None:
@@ -329,6 +426,23 @@ class Collector:
                    if self.config.recheck_after else "")
             )
 
+        tor_session: Optional[aiohttp.ClientSession] = None
+        if self.config.tor_proxy:
+            try:
+                tor_session = aiohttp.ClientSession(
+                    headers={"User-Agent": self.config.user_agent},
+                    connector=tor_connector(self.config),
+                    timeout=aiohttp.ClientTimeout(total=max(30.0, self.config.http_timeout)),
+                )
+                self._log(f"Tor enabled for .onion domains via {self.config.tor_proxy}")
+            except TorUnavailable as exc:
+                self._log(
+                    f"Tor unavailable ({exc}); .onion domains will be stored "
+                    "but not probed",
+                    "WARN",
+                )
+        self._tor_session = tor_session
+
         producer = asyncio.create_task(self._producer(session, cycles), name="producer")
         consumers = [
             asyncio.create_task(self._consumer(session, index), name=f"consumer-{index}")
@@ -360,6 +474,9 @@ class Collector:
                 else:
                     await self.store.flush()
             finally:
+                if tor_session is not None:
+                    await tor_session.close()
+                self._tor_session = None
                 await session.close()
                 await connector.close()
                 # let aiohttp close its transports before the loop goes away
@@ -401,27 +518,39 @@ class Collector:
     async def _fetch_cycle(self, session: "aiohttp.ClientSession") -> int:
         assert self._queue is not None
         wanted = self.config.max_domains_per_cycle
-        queued = await self._queue_rechecks()
+        # Re-checks have their own budget (recheck_batch) and must not consume
+        # the discovery budget, or a large recheck_batch stops discovery.
+        rechecked = await self._queue_rechecks()
+        queued = 0
         if self.config.recheck_only:
             self.stats.queued = self._queue.qsize()
-            return queued
+            return rechecked
         now = time.monotonic()
         usable = [s for s in self.sources if self._cooldowns.get(s.name, 0.0) <= now]
         if not usable:
             soonest = min(self._cooldowns.values()) - now
             self._log(f"All sources cooling down, retrying in {max(1, int(soonest))}s", "WARN")
-            return queued
+            return rechecked
 
-        for source in usable:
+        # Each source gets an equal share of the cycle budget. Serving them in
+        # order until the budget ran out let the first source starve the rest.
+        share = max(1, wanted // len(usable))
+        for index, source in enumerate(usable):
             if self._stop.is_set() or queued >= wanted:
                 break
             remaining = wanted - queued
+            # The last source may use whatever the others left unclaimed.
+            allowance = remaining if index == len(usable) - 1 else min(share, remaining)
             try:
-                candidates = await source.fetch(session, remaining)
+                candidates = await source.fetch(session, allowance)
                 self.stats.source_ok[source.name] += 1
                 self._cooldowns.pop(source.name, None)
             except asyncio.CancelledError:
                 raise
+            except SourceEmpty as exc:
+                # Healthy, just nothing queued yet; no cooldown.
+                self._log(f"{source.name}: {exc}", "INFO")
+                continue
             except SourceError as exc:
                 self.stats.source_fail[source.name] += 1
                 cooldown = min(900, 60 * self.stats.source_fail[source.name])
@@ -434,13 +563,19 @@ class Collector:
                 self._log(f"Source {source.name} raised {type(exc).__name__}: {exc}", "ERROR")
                 continue
 
-            added = 0
+            normalised: List[str] = []
             for candidate in candidates:
+                fingerprint = normalize_domain(candidate)
+                if fingerprint:
+                    normalised.append(fingerprint)
+
+            fresh = await self.store.filter_new(normalised)
+            self.stats.duplicates += len(normalised) - len(fresh)
+
+            added = 0
+            for fingerprint in fresh:
                 if self._stop.is_set():
                     break
-                fingerprint = normalize_domain(candidate)
-                if not fingerprint:
-                    continue
                 if not self.store.reserve(fingerprint):
                     self.stats.duplicates += 1
                     continue
@@ -452,7 +587,7 @@ class Collector:
             self._log(f"{source.name}: {added} new domains queued", "GOOD" if added else "INFO")
 
         self.stats.queued = self._queue.qsize()
-        return queued
+        return queued + rechecked
 
     async def _queue_rechecks(self) -> int:
         """Re-queue domains whose last check is older than ``recheck_after``."""
@@ -494,6 +629,22 @@ class Collector:
                 return False
         return False
 
+    async def _record_discoveries(self, origin: str, hosts: Sequence[str]) -> None:
+        """Queue host names harvested from a probe for a later cycle."""
+        candidates = []
+        for host in hosts:
+            fingerprint = normalize_domain(host)
+            if fingerprint and fingerprint != origin:
+                candidates.append(fingerprint)
+        if not candidates:
+            return
+        try:
+            added = await self.store.push_frontier(candidates, origin=origin)
+        except Exception:
+            return
+        if added:
+            self.stats.discovered += added
+
     async def _sleep_interruptible(self, seconds: float) -> None:
         """Sleep, but wake immediately when the collector is stopped."""
         try:
@@ -518,7 +669,19 @@ class Collector:
             except asyncio.CancelledError:
                 break
             try:
-                result = await probe_domain(session, fingerprint, self.config, ssl_arg)
+                if is_onion(fingerprint):
+                    if self._tor_session is None:
+                        result = ProbeResult(
+                            responsive=False,
+                            reached=False,
+                            error="not probed: no Tor proxy configured",
+                        )
+                    else:
+                        result = await probe_domain(
+                            self._tor_session, fingerprint, self.config, None
+                        )
+                else:
+                    result = await probe_domain(session, fingerprint, self.config, ssl_arg)
                 if not result.responsive and not self.config.store_unresponsive and not is_recheck:
                     self.store.release(fingerprint)
                 else:
@@ -542,6 +705,8 @@ class Collector:
                             self.stats.new += 1
                     else:
                         self.stats.duplicates += 1
+                if result.discovered:
+                    await self._record_discoveries(fingerprint, result.discovered)
                 self.stats.processed += 1
                 if result.responsive:
                     self.stats.responsive += 1
@@ -573,6 +738,7 @@ class Collector:
                             "technologies": result.technologies,
                             "status": result.status_code,
                             "source": source_name,
+                            "recheck": is_recheck,
                         },
                     )
                 )

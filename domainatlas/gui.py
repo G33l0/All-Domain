@@ -1,7 +1,7 @@
 """Tkinter front-end.
 
 Everything that touches a widget happens on the Tk main thread.  The engine
-runs in :class:`~domaincollector.runner.CollectorThread` and communicates only
+runs in :class:`~domainatlas.runner.CollectorThread` and communicates only
 through a queue that is drained by an ``after()`` timer.
 """
 
@@ -14,7 +14,7 @@ from typing import Dict, Optional
 from .config import Config, ConfigError, DEFAULT_CONFIG_PATH
 from .engine import Event
 from .runner import CollectorThread
-from .sources import SOURCE_NAMES
+from .sources import available_sources
 
 try:  # pragma: no cover - import guarded for headless environments
     import tkinter as tk
@@ -41,7 +41,7 @@ def tkinter_available() -> bool:
     return tk is not None
 
 
-class DomainCollectorApp:
+class DomainAtlasApp:
     """The main window."""
 
     def __init__(self, root, config: Config, config_path: str = DEFAULT_CONFIG_PATH) -> None:
@@ -54,7 +54,7 @@ class DomainCollectorApp:
         self._log_lines = 0
         self._state = "stopped"
 
-        root.title("Domain Collector 2.0")
+        root.title("Domain Atlas 2.0")
         root.geometry("1050x720")
         root.minsize(820, 560)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -89,7 +89,8 @@ class DomainCollectorApp:
         frame = tk.Frame(self.root)
         frame.pack(fill=tk.X, padx=10, pady=4)
         self.stat_labels: Dict[str, tk.Label] = {}
-        for key in ("Processed", "Responsive", "Unreachable", "New", "Re-checked", "Queue", "Rate"):
+        for key in ("Processed", "Responsive", "Unreachable", "New", "Re-checked",
+                    "Self-found", "Queue", "Rate"):
             label = tk.Label(frame, text=f"{key}: 0", font=("Arial", 10))
             label.pack(side=tk.LEFT, padx=8)
             self.stat_labels[key] = label
@@ -175,7 +176,7 @@ class DomainCollectorApp:
             title="Export activity log",
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile=f"domain-collector-{datetime.now():%Y%m%d-%H%M%S}.log",
+            initialfile=f"domain-atlas-{datetime.now():%Y%m%d-%H%M%S}.log",
         )
         if not path:
             return
@@ -224,7 +225,7 @@ class DomainCollectorApp:
         source_frame = tk.Frame(dialog)
         source_frame.grid(row=row, column=1, sticky="w", padx=10, pady=4)
         source_vars: Dict[str, tk.BooleanVar] = {}
-        for name in SOURCE_NAMES:
+        for name in available_sources():
             if name == "file":
                 continue
             var = tk.BooleanVar(value=name in self.config.sources)
@@ -354,6 +355,7 @@ class DomainCollectorApp:
         self.stat_labels["New"].config(text=f"New: {stats.new}")
         self.stat_labels["Unreachable"].config(text=f"Unreachable: {stats.unreachable}")
         self.stat_labels["Re-checked"].config(text=f"Re-checked: {stats.rechecked}")
+        self.stat_labels["Self-found"].config(text=f"Self-found: {stats.discovered}")
         self.stat_labels["Queue"].config(text=f"Queue: {stats.queued}")
         self.stat_labels["Rate"].config(text=f"Rate: {stats.rate:.1f}/s")
 
@@ -406,9 +408,9 @@ def run_gui(config: Config, config_path: str = DEFAULT_CONFIG_PATH) -> int:
             "tkinter is not available in this Python installation.\n"
             "Install it (Debian/Ubuntu: 'sudo apt install python3-tk', Fedora: "
             "'sudo dnf install python3-tkinter') or run the collector headless "
-            "with:  python domain_collector.py --headless"
+            "with:  python domain_atlas.py --headless"
         ) from TK_IMPORT_ERROR
     root = tk.Tk()
-    DomainCollectorApp(root, config, config_path)
+    DomainAtlasApp(root, config, config_path)
     root.mainloop()
     return 0

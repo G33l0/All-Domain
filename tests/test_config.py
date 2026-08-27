@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from domaincollector.config import Config, ConfigError
+from domainatlas.config import Config, ConfigError
 
 
 def test_defaults_are_valid():

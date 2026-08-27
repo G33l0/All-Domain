@@ -4,9 +4,9 @@ import time
 
 import pytest
 
-from domaincollector.config import Config
-from domaincollector.engine import Event
-from domaincollector.runner import CollectorThread
+from domainatlas.config import Config
+from domainatlas.engine import Event
+from domainatlas.runner import CollectorThread
 
 
 @pytest.fixture

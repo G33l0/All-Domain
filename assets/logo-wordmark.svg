@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 72" width="360" height="72">
+  <g transform="translate(4 4)">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f6feb"/>
+      <stop offset="1" stop-color="#00c2ff"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.7" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14.1" fill="url(#tile)"/>
+  <rect width="64" height="64" rx="14.1" fill="url(#sheen)"/>
+  <path d="M 32.0 32.0 L 44.4 16.1 A 20.2 20.2 0 0 1 48.3 43.8 Z"
+        fill="#ffffff" fill-opacity="0.26"/>
+  <g fill="none" stroke="#ffffff" stroke-width="3.7" stroke-linecap="round">
+    <circle cx="32.0" cy="32.0" r="20.2"/>
+    <path d="M 32.0 32.0 L 44.4 16.1"/>
+  </g>
+  <circle cx="32.0" cy="32.0" r="10.5" fill="none"
+          stroke="#ffffff" stroke-opacity="0.75" stroke-width="2.7"/>
+  <circle cx="32.0" cy="32.0" r="3.3" fill="#ffffff"/>
+  <circle cx="21.2" cy="25.8" r="3.2" fill="#c6f6ff"/>
+</g>
+  <text x="84" y="38" font-family="Segoe UI Variable Display, Segoe UI, Inter, sans-serif" font-size="27" font-weight="600" fill="#1f6feb">Domain Atlas</text>
+  <text x="85" y="58" font-family="Segoe UI, Inter, sans-serif" font-size="13" fill="#00c2ff">Asynchronous domain intelligence</text>
+</svg>

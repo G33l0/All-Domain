@@ -1,4 +1,4 @@
-"""Configuration handling for Domain Collector.
+"""Configuration handling for Domain Atlas.
 
 The configuration is a plain dataclass that can be loaded from / saved to a
 JSON file.  Every value is validated and clamped to a sane range so a bad
@@ -16,15 +16,18 @@ DEFAULT_CONFIG_PATH = "config.json"
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 domain-collector/2.0"
+    "Chrome/124.0 Safari/537.36 domain-atlas/2.0"
 )
 
 #: Public certstream server.  It is frequently idle - point this at your own
 #: certstream-server-go instance for a reliable feed.
 DEFAULT_CERTSTREAM_URL = "wss://certstream.calidog.io/domains-only"
 
-#: Sources enabled when the user does not choose explicitly.
-DEFAULT_SOURCES: List[str] = ["crtsh", "tranco", "umbrella"]
+#: Sources enabled when the user does not choose explicitly. The two that need
+#: no third-party service lead: "self" recycles the collector's own findings and
+#: "ctlog" reads Certificate Transparency logs directly from their operators.
+#: The ranking lists follow, to seed a cold start and to cover an outage.
+DEFAULT_SOURCES: List[str] = ["self", "ctlog", "tranco", "umbrella"]
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
@@ -95,6 +98,20 @@ class Config:
     certstream_buffer: int = 20000
     #: Seconds a certstream fetch waits for the stream to produce something.
     certstream_wait: float = 15.0
+    #: SOCKS5 proxy used to reach .onion services, e.g. socks5://127.0.0.1:9050.
+    #: Empty means Tor is disabled: .onion domains are still discovered and
+    #: stored, but not probed.
+    tor_proxy: str = ""
+    #: Public index used by the "onion" source.
+    onion_index_url: str = "https://ahmia.fi/onions/"
+    #: Certificate Transparency logs to read. Empty uses the built-in list.
+    ct_logs: List[Dict[str, str]] = field(default_factory=list)
+    #: Feed host names found in fetched pages back into the queue.
+    expand_from_html: bool = True
+    #: Feed host names from probed TLS certificates back into the queue.
+    expand_from_certificates: bool = True
+    #: Upper bound on self-discovered candidates held for later.
+    frontier_limit: int = 500_000
     db_path: str = "domains.db"
     output_dir: str = "output"
     cache_dir: str = ".cache"
@@ -128,6 +145,17 @@ class Config:
         self.certstream_wait = _as_float(
             "certstream_wait", self.certstream_wait, 1.0, 300.0, defaults.certstream_wait
         )
+        tor_proxy = str(self.tor_proxy or "").strip()
+        if tor_proxy and not tor_proxy.startswith(("socks5://", "socks5h://", "socks4://")):
+            raise ConfigError(
+                f"tor_proxy must be a socks5:// URL, got {tor_proxy!r}"
+            )
+        self.tor_proxy = tor_proxy
+        onion_index = str(self.onion_index_url or "").strip() or defaults.onion_index_url
+        if not onion_index.startswith(("http://", "https://")):
+            raise ConfigError(f"onion_index_url must be an http(s) URL, got {onion_index!r}")
+        self.onion_index_url = onion_index
+
         certstream_url = str(self.certstream_url or "").strip() or defaults.certstream_url
         if not certstream_url.startswith(("ws://", "wss://")):
             raise ConfigError(f"certstream_url must start with ws:// or wss://, got {certstream_url!r}")
@@ -137,6 +165,20 @@ class Config:
         self.store_unresponsive = _as_bool("store_unresponsive", self.store_unresponsive, defaults.store_unresponsive)
         self.use_builtwith = _as_bool("use_builtwith", self.use_builtwith, defaults.use_builtwith)
         self.recheck_only = _as_bool("recheck_only", self.recheck_only, defaults.recheck_only)
+        self.expand_from_html = _as_bool("expand_from_html", self.expand_from_html,
+                                         defaults.expand_from_html)
+        self.expand_from_certificates = _as_bool(
+            "expand_from_certificates", self.expand_from_certificates,
+            defaults.expand_from_certificates,
+        )
+        self.frontier_limit = _as_int("frontier_limit", self.frontier_limit, 0, 50_000_000,
+                                      defaults.frontier_limit)
+        if not isinstance(self.ct_logs, list):
+            raise ConfigError("ct_logs must be a list of {name, url} objects")
+        for entry in self.ct_logs:
+            if not isinstance(entry, dict) or not entry.get("url"):
+                raise ConfigError("each ct_logs entry needs a url")
+            entry.setdefault("name", entry["url"])
         if self.recheck_only and self.recheck_after <= 0:
             raise ConfigError("recheck_only needs recheck_after to be greater than 0")
 
