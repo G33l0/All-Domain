@@ -17,6 +17,7 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
+from .paths import ensure_streams, is_frozen, resolve
 from .export import FORMATS as EXPORT_FORMATS
 from .export import ExportError, export_to_path, format_for_path
 from .query import DomainFilter, DomainQuery, QueryError
@@ -25,6 +26,15 @@ from .sources import available_sources
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 DATE_FORMAT = "%H:%M:%S"
+
+
+def default_config_path(requested: str) -> str:
+    """Where settings live: beside the checkout, or in the user's data dir."""
+    if requested != DEFAULT_CONFIG_PATH:
+        return requested
+    if is_frozen():
+        return resolve(DEFAULT_CONFIG_PATH)
+    return requested
 
 
 def _theme_names() -> Sequence[str]:
@@ -279,7 +289,7 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
     want = args.ui
     if want in ("auto", "qt") and pyside_available():
         try:
-            return run_qt_gui(config, args.config, theme=args.theme)
+            return run_qt_gui(config, default_config_path(args.config), theme=args.theme)
         except Exception as exc:  # pragma: no cover - display problems
             print(f"Qt interface could not start ({exc}).", file=sys.stderr)
             if want == "qt":
@@ -299,7 +309,7 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
 
     if tkinter_available():
         try:
-            return run_gui(config, args.config)
+            return run_gui(config, default_config_path(args.config))
         except Exception as exc:  # pragma: no cover - display problems
             print(f"Tk interface could not start ({exc}).", file=sys.stderr)
             if want == "tk":
@@ -308,7 +318,7 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
         from .gui import run_gui as _run_gui
 
         try:
-            _run_gui(config, args.config)
+            _run_gui(config, default_config_path(args.config))
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
         return 1
@@ -319,6 +329,9 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # A windowed build has no console: printing to a None stream would crash
+    # before anything useful happened.
+    ensure_streams()
     try:
         return _main(argv)
     except BrokenPipeError:
@@ -337,8 +350,10 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        config = Config.load(args.config)
+        config_path = default_config_path(args.config)
+        config = Config.load(config_path)
         config = apply_overrides(config, args)
+        config.resolve_paths()
     except ConfigError as exc:
         parser.error(str(exc))
         return 2  # pragma: no cover - argparse exits
@@ -350,11 +365,11 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.save_config:
         try:
-            config.save(args.config)
+            config.save(config_path)
         except ConfigError as exc:
             print(f"Could not save config: {exc}", file=sys.stderr)
             return 1
-        print(f"Configuration written to {args.config}")
+        print(f"Configuration written to {config_path}")
         return 0
 
     try:

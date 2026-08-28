@@ -11,8 +11,9 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/ui-PySide6%20%2F%20Qt%206-41cd52.svg" alt="PySide6">
-  <img src="https://img.shields.io/badge/tests-245%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-259%20passing-brightgreen.svg" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT">
+  <img src="https://img.shields.io/badge/windows-installer-0078d4.svg" alt="Windows installer">
 </p>
 
 <p align="center">
@@ -46,6 +47,27 @@ from a terminal.
 - **Six themes** — Light, Dark, Midnight, Aurora, Amber and a monospaced Hacker theme.
 
 ## Installation
+
+### Windows: install the application
+
+Download `DomainAtlas-Setup-<version>.exe` from the
+[latest release](https://github.com/G33l0/All-Domain/releases) and run it.
+Nothing else is required — Python and Qt are bundled. The default is a per-user
+install, so no administrator prompt appears; choosing "for all users" installs
+to Program Files instead.
+
+The installer places two programs side by side:
+
+| | |
+| --- | --- |
+| `DomainAtlas.exe` | the desktop application |
+| `domain-atlas-cli.exe` | the same program with a console, for `--headless` and exports |
+
+Collected data is written to `%LOCALAPPDATA%\Domain Atlas`, never to the
+installation directory, so the application works normally when installed to a
+read-only location. Uninstalling leaves that data in place.
+
+### From source
 
 ```bash
 git clone https://github.com/G33l0/All-Domain.git
@@ -173,16 +195,23 @@ page scrolls. The window can shrink to 820x460 logical pixels, which fits a
 
 The theme follows the operating system by default and can be changed from the sidebar.
 
-### Building a Windows executable
+### Building the Windows installer
+
+Every push builds and tests the application on a Windows runner and uploads the
+installer as a workflow artifact; tagging a release attaches it to the release. To
+build locally:
 
 ```powershell
 pip install pyinstaller PySide6
 python packaging/make_icons.py
-pyinstaller packaging/domain-atlas.spec
+pyinstaller packaging/domain-atlas.spec --noconfirm
+iscc packaging\domain-atlas.iss
 ```
 
-Produces `dist/DomainAtlas.exe`, a single file with no console window. The same binary
-accepts `--headless` for command line use.
+The first command produces `dist/DomainAtlas/`, a self-contained folder holding both
+executables, and the second wraps it in `packaging/output/DomainAtlas-Setup-<version>.exe`.
+A folder build rather than a single file keeps start-up fast: a one-file build unpacks
+its whole payload on every launch.
 
 ## Configuration
 
@@ -253,6 +282,7 @@ python domain_atlas.py --headless --sources self
 ```
 domainatlas/
   cli.py        command line entry point and argument handling
+  paths.py      file locations, including installed builds
   config.py     validated settings, loaded from and saved to JSON
   ctlog.py      Certificate Transparency reading and certificate parsing
   domains.py    parsing, validation and normalisation of host names
@@ -321,7 +351,7 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-245 tests cover normalisation, fingerprinting, storage and migration, source parsing and
+259 tests cover normalisation, fingerprinting, storage and migration, source parsing and
 caching, certstream against a local websocket server, the query and export layers, the
 threaded runner, the command line, and the desktop interface. Qt tests run on the
 offscreen platform and are skipped when PySide6 is unavailable.

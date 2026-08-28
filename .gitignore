@@ -13,6 +13,8 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+packaging/output/
+packaging/version_info.txt
 .venv/
 venv/
 .pytest_cache/

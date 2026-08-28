@@ -210,6 +210,22 @@ class Config:
         self.log_level = level
         return self
 
+    def resolve_paths(self, base: Optional[str] = None) -> "Config":
+        """Anchor the relative file locations to *base*.
+
+        Installed builds run from a read-only program directory, so the
+        defaults have to land in a per-user directory instead.
+        """
+        from .paths import ensure_base_dir, resolve
+
+        directory = ensure_base_dir(base)
+        self.db_path = resolve(self.db_path, directory)
+        self.output_dir = resolve(self.output_dir, directory)
+        self.cache_dir = resolve(self.cache_dir, directory)
+        if self.seed_file:
+            self.seed_file = resolve(self.seed_file, directory)
+        return self
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
