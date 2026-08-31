@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 
@@ -5,31 +6,27 @@ import pytest
 
 from domainatlas.export import ExportError, export_to_path, format_for_path, write_rows
 from domainatlas.query import DomainFilter, DomainRow
+from domainatlas.store import DomainRecord, DomainStore
 
 
 @pytest.fixture
 def database(tmp_path):
+    """Built by the store, so the export always reads the shipping schema."""
     path = str(tmp_path / "atlas.db")
+
+    async def build():
+        async with DomainStore(path, write_tech_files=False) as store:
+            await store.add(DomainRecord(
+                "a.example", True, ["Nginx", "React"], versions={"Nginx": "1.24"},
+                status_code=200, source="tranco",
+            ))
+            await store.add(DomainRecord("b.example", False, [], source="crtsh", error="timeout"))
+            await store.flush()
+
+    asyncio.run(build())
     connection = sqlite3.connect(path)
-    connection.executescript(
-        """
-        CREATE TABLE domains (
-            fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL, first_seen TIMESTAMP,
-            responsive INTEGER NOT NULL DEFAULT 0, technologies TEXT, status_code INTEGER,
-            scheme TEXT, error TEXT, elapsed_ms INTEGER, source TEXT, checked_at TIMESTAMP);
-        CREATE TABLE domain_tech (fingerprint TEXT NOT NULL, technology TEXT NOT NULL,
-            version TEXT, PRIMARY KEY (fingerprint, technology));
-        """
-    )
-    connection.execute(
-        "INSERT INTO domains (fingerprint, raw, responsive, status_code, source, technologies, "
-        "first_seen) VALUES ('a.example','a.example',1,200,'tranco','[\"Nginx\", \"React\"]','2026-01-01')"
-    )
-    connection.execute(
-        "INSERT INTO domains (fingerprint, raw, responsive, source, error, first_seen) "
-        "VALUES ('b.example','b.example',0,'crtsh','timeout','2026-01-02')"
-    )
-    connection.execute("INSERT INTO domain_tech VALUES ('a.example','Nginx','1.24')")
+    connection.execute("UPDATE domains SET first_seen='2026-01-01' WHERE fingerprint='a.example'")
+    connection.execute("UPDATE domains SET first_seen='2026-01-02' WHERE fingerprint='b.example'")
     connection.commit()
     connection.close()
     return path
@@ -48,7 +45,7 @@ def test_csv_export(tmp_path, database):
     assert export_to_path(database, str(destination), export_format="csv") == 2
     lines = destination.read_text().splitlines()
     assert lines[0].startswith("domain,site,hosts,responsive,status_code")
-    assert any(line.startswith("a.example,,1,True,200") for line in lines)
+    assert any(line.startswith("a.example,a.example,1,True,200") for line in lines)
     assert "Nginx React" in destination.read_text()
 
 

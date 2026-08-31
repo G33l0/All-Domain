@@ -615,7 +615,6 @@ class Collector:
                 continue
             record = DomainRecord(
                 fingerprint=fingerprint,
-                raw=fingerprint,
                 responsive=False,
                 source=source_name,
                 probed=False,
@@ -727,7 +726,6 @@ class Collector:
                 else:
                     record = DomainRecord(
                         fingerprint=fingerprint,
-                        raw=fingerprint,
                         responsive=result.responsive,
                         technologies=result.technologies,
                         versions=result.versions,
