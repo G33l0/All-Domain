@@ -374,3 +374,63 @@ def test_responsive_grid_reflows_by_width(qapp):
     grid._relayout()
     assert grid._columns == 2
     assert grid.minimumSizeHint().width() <= 100
+
+
+def test_every_theme_survives_the_startup_whitelist(qapp, monkeypatch, tmp_path):
+    """A theme chosen in Settings has to come back on the next launch."""
+    from PySide6.QtCore import QTimer
+
+    import domainatlas.qtui as qtui
+    import domainatlas.qtui.mainwindow as mainwindow
+    from domainatlas.qtui.theme import theme_names
+
+    seen = []
+    original = mainwindow.MainWindow.__init__
+
+    def record(self, config, config_path=".", theme="system"):
+        seen.append(theme)
+        original(self, config, config_path, theme)
+        self.timer.stop()
+
+    monkeypatch.setattr(mainwindow.MainWindow, "__init__", record)
+    config = Config(db_path=str(tmp_path / "d.db"), output_dir=str(tmp_path / "out"),
+                    cache_dir=str(tmp_path / "cache")).validate()
+
+    for name in ("system", *theme_names()):
+        QTimer.singleShot(0, qapp.quit)
+        qtui.run_qt_gui(config, str(tmp_path / "config.json"), theme=name)
+
+    assert seen == ["system", *theme_names()]
+
+
+def test_stored_table_follows_a_run_in_progress(window, monkeypatch):
+    """The Domains page must not sit empty while the collector stores rows."""
+    reloads = []
+    monkeypatch.setattr(type(window), "reload_stored",
+                        lambda self: reloads.append(self.current_filter()))
+
+    window._select_page(1)
+    window._state = "running"
+    for _ in range(41):
+        window._pump()
+    assert reloads, "a running collector should refresh the stored list"
+
+    # ... but not while the user is reading further down the list.
+    reloads.clear()
+    window.stored_table.verticalScrollBar().setRange(0, 500)
+    window.stored_table.verticalScrollBar().setValue(120)
+    for _ in range(41):
+        window._pump()
+    assert not reloads
+
+
+def test_shutdown_closes_the_connection_after_the_thread_stops(window):
+    """Closing the query connection from the GUI thread first is a race."""
+    order = []
+    thread = window.browser_thread
+    real_wait = thread.wait
+    thread.wait = lambda msecs=5000: (order.append("wait"), real_wait(msecs))[1]
+    window.browser.close = lambda: order.append("close")
+
+    window.shutdown_browser()
+    assert order == ["wait", "close"]

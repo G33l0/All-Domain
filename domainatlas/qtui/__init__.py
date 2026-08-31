@@ -40,15 +40,11 @@ def run_qt_gui(config: Config, config_path: str = DEFAULT_CONFIG_PATH,
             "You can also run the Tk interface with --ui tk, or headless with --headless."
         ) from _IMPORT_ERROR
 
-    from PySide6.QtCore import QSettings, Qt
+    from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
 
     from .mainwindow import MainWindow
-    from .theme import palette_for
-
-    # Crisp text and icons on high-DPI Windows displays.
-    if hasattr(Qt.ApplicationAttribute, "AA_UseHighDpiPixmaps"):
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+    from .theme import palette_for, theme_names
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Domain Atlas")
@@ -58,7 +54,7 @@ def run_qt_gui(config: Config, config_path: str = DEFAULT_CONFIG_PATH,
 
     if theme is None:
         theme = str(QSettings("DomainAtlas", "DomainAtlas").value("theme", "system"))
-    if theme not in ("system", "light", "dark"):
+    if theme not in ("system", *theme_names()):
         theme = "system"
 
     window = MainWindow(config, config_path, theme=theme)

@@ -50,7 +50,7 @@ from ..engine import Event
 from ..query import ORDER_NEWEST, DomainFilter
 from ..runner import CollectorThread
 from ..sources import available_sources
-from .browser import ExportTask, StoredDomainModel, start_browser
+from .browser import PAGE_SIZE, ExportTask, StoredDomainModel, start_browser
 from .icons import make_icon
 from .logo import logo_icon
 from .models import (
@@ -74,6 +74,9 @@ from .widgets import (
 
 POLL_MS = 250
 MAX_LOG_BLOCKS = 3000
+
+#: Indices of the pages inside the stacked widget, in nav order.
+PAGE_DASHBOARD, PAGE_DOMAINS, PAGE_TECH, PAGE_LOG, PAGE_SETTINGS = range(5)
 
 
 class MainWindow(QMainWindow):
@@ -763,6 +766,10 @@ class MainWindow(QMainWindow):
         ]
         self.page_title.setText(titles[index][0])
         self.page_subtitle.setText(titles[index][1])
+        if index in (PAGE_DOMAINS, PAGE_TECH) and getattr(self, "_state", "") == "running":
+            if index == PAGE_DOMAINS:
+                self._auto_refresh_stored()
+            self.request_summary.emit()
 
     def on_start(self) -> None:
         if self.collector.running:
@@ -940,6 +947,22 @@ class MainWindow(QMainWindow):
         except ConfigError as exc:
             QMessageBox.warning(self, "Settings not saved", str(exc))
 
+    def _auto_refresh_stored(self) -> None:
+        """Pull newly stored domains into the Domains page during a run.
+
+        Only done when it cannot disturb what the user is looking at: the
+        page has to be on screen, scrolled to the top, and showing no more
+        than the first page of results.
+        """
+        if self.pages.currentIndex() != PAGE_DOMAINS:
+            return
+        if self.stored_table.verticalScrollBar().value() != 0:
+            return
+        if self.stored_model.loaded_count() > PAGE_SIZE:
+            return
+        self.reload_stored()
+        self.request_facets.emit()
+
     # ------------------------------------------------------------------ pump
     def _pump(self) -> None:
         try:
@@ -955,6 +978,7 @@ class MainWindow(QMainWindow):
             self._refresh_tick = getattr(self, "_refresh_tick", 0) + 1
             if self._state == "running" and self._refresh_tick % 40 == 0:
                 self.request_summary.emit()
+                self._auto_refresh_stored()
         except Exception as exc:  # pragma: no cover - the UI must never die
             self.log(f"UI error: {type(exc).__name__}: {exc}", "ERROR")
 
@@ -1091,9 +1115,11 @@ class MainWindow(QMainWindow):
         thread = getattr(self, "browser_thread", None)
         if thread is None:
             return
-        browser = getattr(self, "browser", None)
-        if browser is not None:
-            browser.close()
         thread.quit()
-        thread.wait(5000)
+        stopped = thread.wait(5000)
+        browser = getattr(self, "browser", None)
+        # Close the connection only once the thread that owns it has finished,
+        # otherwise a query still in flight reads from a closed handle.
+        if browser is not None and stopped:
+            browser.close()
         self.browser_thread = None

@@ -186,6 +186,10 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
 def _make_logger(level: str) -> logging.Logger:
     logging.basicConfig(level=getattr(logging, level, logging.INFO),
                         format=LOG_FORMAT, datefmt=DATE_FORMAT, stream=sys.stdout)
+    # Debug logging is for diagnosing the collector, not for a transcript of
+    # every statement the database and HTTP layers run.
+    for noisy in ("aiosqlite", "asyncio", "aiohttp", "websockets", "charset_normalizer"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
     return logging.getLogger("domain-atlas")
 
 
@@ -362,6 +366,12 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         valid = ("system",) + tuple(_theme_names())
         if args.theme not in valid:
             parser.error(f"--theme must be one of: {', '.join(valid)}")
+
+    known = set(available_sources())
+    unknown = [name for name in config.sources if name not in known]
+    if unknown:
+        parser.error("unknown source(s): %s; valid sources: %s"
+                     % (", ".join(unknown), ", ".join(available_sources())))
 
     if args.save_config:
         try:
