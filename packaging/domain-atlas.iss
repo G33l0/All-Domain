@@ -10,6 +10,7 @@
 
 #define AppName "Domain Atlas"
 #define AppExeName "DomainAtlas.exe"
+#define AppUserModelID "DomainAtlas.DomainAtlas.Desktop.3"
 #define AppCliName "domain-atlas-cli.exe"
 #define AppPublisher "Domain Atlas"
 #define AppUrl "https://github.com/G33l0/All-Domain"
@@ -52,9 +53,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "..\dist\DomainAtlas\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+; AppUserModelID must match the identifier the application sets at startup,
+; otherwise a pinned shortcut and the running window become two taskbar buttons.
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "{#AppUserModelID}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon; AppUserModelID: "{#AppUserModelID}"
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Start {#AppName}"; Flags: nowait postinstall skipifsilent

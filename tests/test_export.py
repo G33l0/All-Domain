@@ -47,8 +47,8 @@ def test_csv_export(tmp_path, database):
     destination = tmp_path / "out.csv"
     assert export_to_path(database, str(destination), export_format="csv") == 2
     lines = destination.read_text().splitlines()
-    assert lines[0].startswith("domain,responsive,status_code")
-    assert any(line.startswith("a.example,True,200") for line in lines)
+    assert lines[0].startswith("domain,site,hosts,responsive,status_code")
+    assert any(line.startswith("a.example,,1,True,200") for line in lines)
     assert "Nginx React" in destination.read_text()
 
 

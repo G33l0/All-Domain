@@ -434,3 +434,30 @@ def test_shutdown_closes_the_connection_after_the_thread_stops(window):
 
     window.shutdown_browser()
     assert order == ["wait", "close"]
+
+
+def test_page_subtitles_are_never_elided_at_the_minimum_width(window, qapp):
+    """A cut-off subtitle ("Live discovery…") reads as a rendering fault."""
+    from domainatlas.qtui.mainwindow import PAGE_HEADINGS
+
+    window.resize(820, 460)
+    qapp.processEvents()
+    for index, (title, subtitle) in enumerate(PAGE_HEADINGS):
+        window._select_page(index)
+        qapp.processEvents()
+        assert window.page_title.text() == title
+        assert window.page_subtitle.fullText() == subtitle
+        assert window.page_subtitle.text() == subtitle, (
+            f"{title} subtitle was elided to {window.page_subtitle.text()!r}"
+        )
+
+
+def test_the_application_carries_the_brand_icon(window, qapp):
+    """The taskbar reads the icon off the application, not only the window."""
+    from domainatlas.qtui import claim_windows_taskbar_identity
+    from domainatlas.qtui.logo import ICON_SIZES
+
+    assert not window.windowIcon().isNull()
+    assert sorted(s.width() for s in window.windowIcon().availableSizes()) == list(ICON_SIZES)
+    # Safe to call anywhere; only Windows has a shell to tell.
+    assert claim_windows_taskbar_identity() in (True, False)

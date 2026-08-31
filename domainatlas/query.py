@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 COUNT_CAP = 100_000
@@ -46,6 +46,9 @@ class DomainFilter:
     status_code: Optional[int] = None
     since: Optional[str] = None
     onion: Optional[bool] = None
+    #: Show one row per site instead of one per host name, so a domain and
+    #: its ``www.`` and subdomain variants are a single result.
+    sites_only: bool = False
 
     def is_empty(self) -> bool:
         return not any(
@@ -55,6 +58,8 @@ class DomainFilter:
     def where(self) -> Tuple[str, List[Any]]:
         clauses: List[str] = []
         params: List[Any] = []
+        if self.sites_only:
+            clauses.append("d.is_primary = 1")
         if self.text:
             clauses.append("d.fingerprint LIKE ? ESCAPE '\\'")
             params.append(f"%{_escape_like(self.text.strip().lower())}%")
@@ -104,10 +109,15 @@ class DomainRow:
     first_seen: Optional[str]
     checked_at: Optional[str]
     technologies: List[str] = field(default_factory=list)
+    site: str = ""
+    #: How many host names share this row's site, including this one. Only
+    #: filled in for a grouped listing, where it reads as "and N more".
+    variants: int = 1
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "domain": self.fingerprint,
+            "site": self.site,
             "responsive": self.responsive,
             "status_code": self.status_code,
             "scheme": self.scheme,
@@ -139,6 +149,7 @@ def _row_to_domain(row: sqlite3.Row) -> DomainRow:
         first_seen=row["first_seen"],
         checked_at=row["checked_at"],
         technologies=technologies,
+        site=row["site"] or "",
     )
 
 
@@ -149,6 +160,7 @@ class DomainQuery:
         self.db_path = db_path
         self._connection: Optional[sqlite3.Connection] = None
         self._has_undated = False
+        self._has_sites = False
 
     def open(self) -> "DomainQuery":
         if not os.path.exists(self.db_path):
@@ -166,6 +178,14 @@ class DomainQuery:
                     "SELECT 1 FROM domains WHERE first_seen IS NULL LIMIT 1"
                 ).fetchone()
             )
+            # A database written by an older release has no site column, and
+            # this handle is read-only so it cannot add one. Grouping is
+            # dropped for that case rather than failing every read; the
+            # collector migrates the file the next time it runs.
+            columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(domains)")
+            }
+            self._has_sites = "site" in columns and "is_primary" in columns
         except sqlite3.Error as exc:
             raise QueryError(f"cannot open {self.db_path}: {exc}") from exc
         return self
@@ -187,6 +207,25 @@ class DomainQuery:
             raise QueryError("query handle is not open")
         return self._connection
 
+    @property
+    def supports_sites(self) -> bool:
+        """Whether this database can group host names under their site."""
+        return self._has_sites
+
+    def _projection(self) -> str:
+        site = "d.site" if self._has_sites else "'' AS site"
+        return (
+            "SELECT d.fingerprint, d.responsive, d.status_code, d.scheme, d.source, "
+            f"       d.error, d.first_seen, d.checked_at, d.technologies, {site} "
+        )
+
+    def _criteria(self, criteria: Optional[DomainFilter]) -> DomainFilter:
+        """Drop grouping when the database predates it."""
+        criteria = criteria or DomainFilter()
+        if criteria.sites_only and not self._has_sites:
+            criteria = replace(criteria, sites_only=False)
+        return criteria
+
     def page(
         self,
         criteria: Optional[DomainFilter] = None,
@@ -200,7 +239,7 @@ class DomainQuery:
         SQLite walk every skipped row, which turns deep scrolling into a
         multi-second stall on a large database.
         """
-        criteria = criteria or DomainFilter()
+        criteria = self._criteria(criteria)
         where, params = criteria.where()
         params = list(params)
 
@@ -232,14 +271,36 @@ class DomainQuery:
             # order but make the index unusable.
             order_by = "d.first_seen DESC, d.fingerprint DESC"
 
-        sql = (
-            "SELECT d.fingerprint, d.responsive, d.status_code, d.scheme, d.source, "
-            "       d.error, d.first_seen, d.checked_at, d.technologies "
-            f"FROM domains d WHERE {where} ORDER BY {order_by} LIMIT ?"
-        )
+        sql = self._projection() + f"FROM domains d WHERE {where} ORDER BY {order_by} LIMIT ?"
         params.append(int(limit))
         cursor = self.connection.execute(sql, params)
-        return [_row_to_domain(row) for row in cursor]
+        rows = [_row_to_domain(row) for row in cursor]
+        if criteria.sites_only:
+            self._fill_variant_counts(rows)
+        return rows
+
+    def _fill_variant_counts(self, rows: List[DomainRow]) -> None:
+        """Count the host names behind each row of a grouped page.
+
+        One grouped query over the page's own sites, so the cost is fixed by
+        the page size rather than by how much is stored.
+        """
+        sites = {row.site for row in rows if row.site}
+        if not sites:
+            return
+        names = list(sites)
+        counts: Dict[str, int] = {}
+        for start in range(0, len(names), 400):
+            chunk = names[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = self.connection.execute(
+                f"SELECT site, COUNT(*) FROM domains WHERE site IN ({placeholders}) "
+                f"GROUP BY site",
+                chunk,
+            )
+            counts.update({site: total for site, total in cursor})
+        for row in rows:
+            row.variants = counts.get(row.site, 1)
 
     @staticmethod
     def cursor_for(row: DomainRow) -> Cursor:
@@ -253,13 +314,9 @@ class DomainQuery:
         Used by exports so a multi-million row result never has to be held in
         memory at once.
         """
-        criteria = criteria or DomainFilter()
+        criteria = self._criteria(criteria)
         where, params = criteria.where()
-        sql = (
-            "SELECT d.fingerprint, d.responsive, d.status_code, d.scheme, d.source, "
-            "       d.error, d.first_seen, d.checked_at, d.technologies "
-            f"FROM domains d WHERE {where} ORDER BY d.fingerprint ASC"
-        )
+        sql = self._projection() + f"FROM domains d WHERE {where} ORDER BY d.fingerprint ASC"
         cursor = self.connection.execute(sql, params)
         while True:
             rows = cursor.fetchmany(batch_size)
@@ -270,13 +327,14 @@ class DomainQuery:
 
     def count(self, criteria: Optional[DomainFilter] = None, cap: int = COUNT_CAP) -> Tuple[int, bool]:
         """``(count, capped)`` - counting stops at *cap* so the UI stays responsive."""
-        criteria = criteria or DomainFilter()
+        criteria = self._criteria(criteria)
         cap = int(cap)
 
         # A technology-only filter is answered from the technology index
         # instead of testing EXISTS against every domain row.
         if (
             criteria.technology
+            and not criteria.sites_only
             and not criteria.text
             and not criteria.source
             and not criteria.since

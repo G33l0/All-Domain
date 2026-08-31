@@ -19,7 +19,9 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import aiosqlite
 
-SCHEMA_VERSION = 2
+from .domains import site_of
+
+SCHEMA_VERSION = 3
 
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9 ._+-]")
 _RESERVED_WINDOWS_NAMES = {
@@ -177,6 +179,8 @@ class DomainStore:
             ("elapsed_ms", "ALTER TABLE domains ADD COLUMN elapsed_ms INTEGER"),
             ("source", "ALTER TABLE domains ADD COLUMN source TEXT"),
             ("checked_at", "ALTER TABLE domains ADD COLUMN checked_at TIMESTAMP"),
+            ("site", "ALTER TABLE domains ADD COLUMN site TEXT"),
+            ("is_primary", "ALTER TABLE domains ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 1"),
         ):
             if column not in existing:
                 await self._db.execute(ddl)
@@ -211,8 +215,12 @@ class DomainStore:
             "CREATE INDEX IF NOT EXISTS idx_domains_first_seen ON domains(first_seen, fingerprint)",
             "CREATE INDEX IF NOT EXISTS idx_domains_checked_at ON domains(checked_at)",
             "CREATE INDEX IF NOT EXISTS idx_domain_tech_tech ON domain_tech(technology)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_site ON domains(site)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_primary "
+            "ON domains(is_primary, first_seen, fingerprint)",
         ):
             await self._db.execute(statement)
+        await self._backfill_sites()
         # Rows written before first_seen had a default would otherwise need a
         # slower NULL-aware ordering on every read.
         await self._db.execute(
@@ -221,6 +229,58 @@ class DomainStore:
         )
         await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         await self._db.commit()
+
+    async def _backfill_sites(self) -> None:
+        """Fill in the site of rows written before the column existed."""
+        assert self._db is not None
+        while True:
+            async with self._db.execute(
+                "SELECT fingerprint, raw FROM domains WHERE site IS NULL LIMIT 20000"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            if not rows:
+                break
+            await self._db.executemany(
+                "UPDATE domains SET site = ? WHERE fingerprint = ?",
+                [(site_of(raw), fingerprint) for fingerprint, raw in rows],
+            )
+            await self._db.commit()
+            await self._reconcile_sites({site_of(raw) for _fingerprint, raw in rows})
+
+    async def _reconcile_sites(self, sites: Set[str]) -> None:
+        """Elect one representative host per site.
+
+        The listing shows a site once rather than once per host name, so
+        ``example.com`` and ``www.example.com`` do not read as two results.
+        The winner is the shortest name, which is always the apex; ordering
+        by name alone would pick whichever variant sorted first.
+        """
+        assert self._db is not None
+        names = [site for site in sites if site]
+        if not names:
+            return
+        for start in range(0, len(names), 400):
+            chunk = names[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            await self._db.execute(
+                f"UPDATE domains SET is_primary = 0 "
+                f"WHERE site IN ({placeholders}) AND is_primary = 1",
+                chunk,
+            )
+            await self._db.execute(
+                f"""
+                UPDATE domains SET is_primary = 1 WHERE fingerprint IN (
+                    SELECT fingerprint FROM (
+                        SELECT fingerprint, ROW_NUMBER() OVER (
+                            PARTITION BY site
+                            ORDER BY length(raw) - length(replace(raw, '.', '')),
+                                     length(raw), raw
+                        ) AS rank FROM domains WHERE site IN ({placeholders})
+                    ) WHERE rank = 1
+                )
+                """,
+                chunk,
+            )
 
     # ------------------------------------------------------------ dedup logic
     def _remember(self, fingerprint: str) -> None:
@@ -340,6 +400,7 @@ class DomainStore:
                 return (
                     record.fingerprint,
                     record.raw,
+                    site_of(record.raw),
                     1 if record.responsive else 0,
                     json.dumps(record.technologies) if record.technologies else None,
                     record.status_code,
@@ -351,7 +412,8 @@ class DomainStore:
                 )
 
             rows = [values(record) for record in batch if not record.recheck]
-            updates = [values(record)[2:] + (record.fingerprint,) for record in batch if record.recheck]
+            updates = [values(record)[3:] + (record.fingerprint,) for record in batch if record.recheck]
+            new_sites = {row[2] for row in rows}
             rechecked = [record.fingerprint for record in batch if record.recheck]
             tech_rows = [
                 (record.fingerprint, technology, record.versions.get(technology) or None)
@@ -371,12 +433,13 @@ class DomainStore:
                     await self._db.executemany(
                         """
                         INSERT OR IGNORE INTO domains
-                            (fingerprint, raw, responsive, technologies, status_code,
+                            (fingerprint, raw, site, responsive, technologies, status_code,
                              scheme, error, elapsed_ms, source, checked_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         rows,
                     )
+                    await self._reconcile_sites(new_sites)
                 if updates:
                     await self._db.executemany(
                         """

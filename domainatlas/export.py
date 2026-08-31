@@ -17,7 +17,7 @@ from .query import DomainFilter, DomainQuery, DomainRow
 FORMATS = ("csv", "json", "jsonl", "txt")
 
 CSV_FIELDS = (
-    "domain", "responsive", "status_code", "scheme", "source",
+    "domain", "site", "hosts", "responsive", "status_code", "scheme", "source",
     "first_seen", "checked_at", "technologies", "error",
 )
 
@@ -29,6 +29,7 @@ class ExportError(RuntimeError):
 def _flatten(row: DomainRow) -> dict:
     data = row.as_dict()
     data["technologies"] = " ".join(row.technologies)
+    data["hosts"] = row.variants
     return data
 
 

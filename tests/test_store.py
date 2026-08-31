@@ -377,3 +377,95 @@ async def test_frontier_survives_a_restart(tmp_path):
         assert await second.take_frontier(10) == ["persist.example"]
     finally:
         await second.close()
+
+
+@pytest.mark.asyncio
+async def test_host_variants_collapse_to_one_site(tmp_path):
+    """f-milano.net and www.f-milano.net must not read as two results."""
+    from domainatlas.query import DomainFilter, DomainQuery
+
+    path = tmp_path / "sites.db"
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        for host in ("www.f-milano.net", "f-milano.net", "mail.f-milano.net",
+                     "other.example.com"):
+            await store.add(DomainRecord(fingerprint=host, raw=host, responsive=True))
+        await store.flush()
+
+    query = DomainQuery(str(path)).open()
+    try:
+        assert query.supports_sites is True
+        every_host = query.page(DomainFilter(), limit=50)
+        grouped = query.page(DomainFilter(sites_only=True), limit=50)
+        assert len(every_host) == 4
+        names = sorted(row.fingerprint for row in grouped)
+        assert names == ["f-milano.net", "other.example.com"]
+        milano = next(row for row in grouped if row.site == "f-milano.net")
+        assert milano.variants == 3
+        assert query.count(DomainFilter(sites_only=True)) == (2, False)
+    finally:
+        query.close()
+
+
+@pytest.mark.asyncio
+async def test_a_later_apex_takes_over_as_the_site_representative(tmp_path):
+    """The shortest name wins however late it turns up."""
+    from domainatlas.query import DomainFilter, DomainQuery
+
+    path = tmp_path / "late.db"
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        await store.add(DomainRecord(fingerprint="www.late.test", raw="www.late.test"))
+        await store.flush()
+        await store.add(DomainRecord(fingerprint="late.test", raw="late.test"))
+        await store.flush()
+
+    query = DomainQuery(str(path)).open()
+    try:
+        grouped = query.page(DomainFilter(sites_only=True), limit=50)
+        assert [row.fingerprint for row in grouped] == ["late.test"]
+        assert grouped[0].variants == 2
+    finally:
+        query.close()
+
+
+@pytest.mark.asyncio
+async def test_a_database_from_an_older_release_gains_sites_on_open(tmp_path):
+    import sqlite3
+
+    from domainatlas.query import DomainFilter, DomainQuery
+
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(
+        """
+        CREATE TABLE domains (
+            fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL, first_seen TIMESTAMP,
+            responsive INTEGER NOT NULL DEFAULT 0, technologies TEXT,
+            status_code INTEGER, scheme TEXT, error TEXT, elapsed_ms INTEGER,
+            source TEXT, checked_at TIMESTAMP);
+        INSERT INTO domains (fingerprint, raw, first_seen, responsive)
+        VALUES ('www.old.test', 'www.old.test', '2026-01-01 00:00:00', 1),
+               ('old.test', 'old.test', '2026-01-01 00:00:01', 1);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    # Read-only handles cannot migrate, so grouping is dropped rather than failing.
+    before = DomainQuery(str(path)).open()
+    try:
+        assert before.supports_sites is False
+        assert len(before.page(DomainFilter(sites_only=True), limit=10)) == 2
+    finally:
+        before.close()
+
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        assert store is not None
+
+    after = DomainQuery(str(path)).open()
+    try:
+        assert after.supports_sites is True
+        rows = after.page(DomainFilter(sites_only=True), limit=10)
+        assert [row.fingerprint for row in rows] == ["old.test"]
+        assert rows[0].variants == 2
+    finally:
+        after.close()

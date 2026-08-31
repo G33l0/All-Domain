@@ -78,6 +78,16 @@ MAX_LOG_BLOCKS = 3000
 #: Indices of the pages inside the stacked widget, in nav order.
 PAGE_DASHBOARD, PAGE_DOMAINS, PAGE_TECH, PAGE_LOG, PAGE_SETTINGS = range(5)
 
+#: Header title and subtitle per page. Subtitles are kept short enough to read
+#: in full at the smallest supported window width rather than being elided.
+PAGE_HEADINGS = (
+    ("Dashboard", "Live discovery and fingerprinting"),
+    ("Domains", "Every domain stored, searchable"),
+    ("Technologies", "What the live domains run on"),
+    ("Activity log", "Everything the collector reported"),
+    ("Settings", "Applied now, saved to your config"),
+)
+
 
 class MainWindow(QMainWindow):
     open_database = Signal(str)
@@ -212,12 +222,15 @@ class MainWindow(QMainWindow):
         titles.setSpacing(1)
         self.page_title = QLabel("Dashboard")
         self.page_title.setObjectName("pageTitle")
-        self.page_subtitle = ElidingLabel("Live discovery and technology fingerprinting")
+        self.page_subtitle = ElidingLabel(PAGE_HEADINGS[PAGE_DASHBOARD][1])
         self.page_subtitle.setObjectName("pageSubtitle")
         titles.addWidget(self.page_title)
         titles.addWidget(self.page_subtitle)
-        header.addLayout(titles)
-        header.addStretch(1)
+        # The title block takes the free width. Without a stretch factor the
+        # column is only as wide as the page title, and the longer subtitle
+        # underneath it is elided even on a wide window.
+        header.addLayout(titles, 1)
+        header.addSpacing(10)
 
         self.status_pill = StatusPill()
         header.addWidget(self.status_pill)
@@ -322,6 +335,16 @@ class MainWindow(QMainWindow):
         self.filter_network.currentIndexChanged.connect(self._schedule_reload)
         filters.add(self.filter_network)
 
+        self.filter_grouping = QComboBox()
+        for label, value in (("One row per site", True), ("Every host name", False)):
+            self.filter_grouping.addItem(label, value)
+        self.filter_grouping.setToolTip(
+            "Grouped, example.com and www.example.com are one result.\n"
+            "Ungrouped, every host name observed is listed separately."
+        )
+        self.filter_grouping.currentIndexChanged.connect(self._schedule_reload)
+        filters.add(self.filter_grouping)
+
         self.btn_clear_filters = QPushButton("Clear filters")
         self.btn_clear_filters.clicked.connect(self.clear_filters)
         filters.add(self.btn_clear_filters)
@@ -340,7 +363,7 @@ class MainWindow(QMainWindow):
 
     def clear_filters(self) -> None:
         for combo in (self.filter_technology, self.filter_source,
-                      self.filter_status, self.filter_network):
+                      self.filter_status, self.filter_network, self.filter_grouping):
             combo.blockSignals(True)
             combo.setCurrentIndex(0)
             combo.blockSignals(False)
@@ -562,14 +585,15 @@ class MainWindow(QMainWindow):
         header = table.horizontalHeader()
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(46)
-        table.setColumnWidth(0, 260)
-        table.setColumnWidth(1, 90)
-        table.setColumnWidth(2, 70)
-        table.setColumnWidth(3, 110)
-        table.setColumnWidth(4, 150)
+        table.setColumnWidth(0, 260)  # Domain
+        table.setColumnWidth(1, 56)   # Hosts
+        table.setColumnWidth(2, 90)   # Status
+        table.setColumnWidth(3, 70)   # HTTP
+        table.setColumnWidth(4, 110)  # Source
+        table.setColumnWidth(5, 150)  # First seen
         delegate = StatusDotDelegate(StoredDomainModel.ROLE_RESPONSIVE,
                                      self.palette_.success, self.palette_.text_faint, table)
-        table.setItemDelegateForColumn(1, delegate)
+        table.setItemDelegateForColumn(2, delegate)
         table.status_delegate = delegate
         return table
 
@@ -667,6 +691,7 @@ class MainWindow(QMainWindow):
             source=self.filter_source.currentData(),
             responsive=self.filter_status.currentData(),
             onion=self.filter_network.currentData(),
+            sites_only=bool(self.filter_grouping.currentData()),
         )
 
     def _schedule_reload(self) -> None:
@@ -690,18 +715,19 @@ class MainWindow(QMainWindow):
     def _update_result_label(self) -> None:
         loaded = self.stored_model.loaded_count()
         total = self.stored_model.total
+        noun = "sites" if self.stored_model.filter.sites_only else "domains"
         if loaded and not getattr(self, "_counted", False):
-            self.result_label.setText(f"Showing {loaded:,} domains, counting…")
+            self.result_label.setText(f"Showing {loaded:,} {noun}, counting…")
             return
         if total == 0 and loaded == 0:
             criteria = self.current_filter()
             self.result_label.setText(
-                "No domains match this filter." if not criteria.is_empty()
+                f"No {noun} match this filter." if not criteria.is_empty()
                 else "No domains stored yet - press Start to begin collecting."
             )
             return
         total_text = f"{total:,}+" if self.stored_model.total_capped else f"{total:,}"
-        self.result_label.setText(f"Showing {loaded:,} of {total_text} matching domains")
+        self.result_label.setText(f"Showing {loaded:,} of {total_text} matching {noun}")
 
     @Slot(list, list)
     def _on_facets(self, technologies: list, sources: list) -> None:
@@ -757,13 +783,7 @@ class MainWindow(QMainWindow):
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
         self.pages.setCurrentIndex(index)
-        titles = [
-            ("Dashboard", "Live discovery and technology fingerprinting"),
-            ("Domains", "Everything stored, searchable and filterable"),
-            ("Technologies", "What the live domains are built with"),
-            ("Activity log", "Everything the collector reported"),
-            ("Settings", "Applied to this run and saved to your config file"),
-        ]
+        titles = PAGE_HEADINGS
         self.page_title.setText(titles[index][0])
         self.page_subtitle.setText(titles[index][1])
         if index in (PAGE_DOMAINS, PAGE_TECH) and getattr(self, "_state", "") == "running":

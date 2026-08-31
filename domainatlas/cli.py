@@ -129,6 +129,9 @@ def build_parser() -> argparse.ArgumentParser:
                               help="only .onion domains")
     export_group.add_argument("--filter-clearnet", action="store_true",
                               help="exclude .onion domains")
+    export_group.add_argument("--sites-only", action="store_true",
+                              help="one row per site instead of one per host name "
+                                   "(example.com and www.example.com count once)")
     return parser
 
 
@@ -157,6 +160,7 @@ def filter_from_args(args: argparse.Namespace) -> DomainFilter:
         responsive=responsive,
         since=args.filter_since,
         onion=onion,
+        sites_only=bool(getattr(args, "sites_only", False)),
     )
 
 

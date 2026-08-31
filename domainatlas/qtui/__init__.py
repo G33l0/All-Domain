@@ -11,6 +11,10 @@ from ..config import DEFAULT_CONFIG_PATH, Config
 
 __all__ = ["pyside_available", "run_qt_gui"]
 
+#: Identifies the application to the Windows shell. Without it a source
+#: checkout is grouped under python.exe and inherits the Python icon.
+APP_USER_MODEL_ID = "DomainAtlas.DomainAtlas.Desktop.3"
+
 _IMPORT_ERROR: Optional[BaseException] = None
 
 
@@ -29,6 +33,27 @@ def import_error() -> Optional[BaseException]:
     return _IMPORT_ERROR
 
 
+def claim_windows_taskbar_identity(app_id: str = APP_USER_MODEL_ID) -> bool:
+    """Tell Windows this process is its own application.
+
+    A source checkout runs inside python.exe, and the shell groups the window
+    under that host process, taskbar icon included. Setting an explicit
+    AppUserModelID gives the window its own button and its own icon. Frozen
+    builds get the same treatment so pinning survives an upgrade.
+
+    Returns True when the shell accepted the identifier.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:  # pragma: no cover - not Windows, or an old shell32
+        return False
+    return True
+
+
 def run_qt_gui(config: Config, config_path: str = DEFAULT_CONFIG_PATH,
                theme: Optional[str] = None) -> int:
     """Open the Qt window.  Returns a process exit code."""
@@ -43,14 +68,19 @@ def run_qt_gui(config: Config, config_path: str = DEFAULT_CONFIG_PATH,
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
 
+    from .logo import logo_icon
     from .mainwindow import MainWindow
     from .theme import palette_for, theme_names
+
+    claim_windows_taskbar_identity()
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Domain Atlas")
     app.setOrganizationName("DomainAtlas")
     app.setApplicationDisplayName("Domain Atlas")
+    app.setDesktopFileName("domain-atlas")  # taskbar identity on Linux
     app.setStyle("Fusion")  # renders identically on every platform
+    app.setWindowIcon(logo_icon())
 
     if theme is None:
         theme = str(QSettings("DomainAtlas", "DomainAtlas").value("theme", "system"))
