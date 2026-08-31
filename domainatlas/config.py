@@ -92,6 +92,10 @@ class Config:
     recheck_batch: int = 100
     #: Only re-check stored domains; do not pull new candidates from sources.
     recheck_only: bool = False
+    #: Record every name a source reports without connecting to it. Probing is
+    #: what limits throughput; turning it off trades the status and technology
+    #: columns for roughly three orders of magnitude more names per hour.
+    probe_domains: bool = True
     #: Live Certificate Transparency stream (certstream-server protocol).
     certstream_url: str = DEFAULT_CERTSTREAM_URL
     #: How many streamed domains to hold between cycles.
@@ -165,6 +169,7 @@ class Config:
         self.store_unresponsive = _as_bool("store_unresponsive", self.store_unresponsive, defaults.store_unresponsive)
         self.use_builtwith = _as_bool("use_builtwith", self.use_builtwith, defaults.use_builtwith)
         self.recheck_only = _as_bool("recheck_only", self.recheck_only, defaults.recheck_only)
+        self.probe_domains = _as_bool("probe_domains", self.probe_domains, defaults.probe_domains)
         self.expand_from_html = _as_bool("expand_from_html", self.expand_from_html,
                                          defaults.expand_from_html)
         self.expand_from_certificates = _as_bool(
@@ -181,6 +186,9 @@ class Config:
             entry.setdefault("name", entry["url"])
         if self.recheck_only and self.recheck_after <= 0:
             raise ConfigError("recheck_only needs recheck_after to be greater than 0")
+        if self.recheck_only and not self.probe_domains:
+            raise ConfigError("recheck_only re-probes stored domains, so probe_domains "
+                              "must stay enabled")
 
         if not str(self.db_path).strip():
             raise ConfigError("db_path must not be empty")

@@ -91,6 +91,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="re-probe stored domains older than this (0 disables re-checking)")
     parser.add_argument("--recheck-batch", type=int, default=None, dest="recheck_batch",
                         metavar="N", help="how many stale domains to re-queue per cycle")
+    parser.add_argument("--no-probe", dest="no_probe", action="store_true",
+                        help="record every name a source reports without connecting to it: "
+                             "far more names per hour, no status or technology data")
     parser.add_argument("--recheck-only", action="store_true",
                         help="only re-check stored domains, do not discover new ones "
                              "(requires --recheck-after)")
@@ -184,6 +187,8 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
         config.use_builtwith = True
     if args.recheck_only:
         config.recheck_only = True
+    if args.no_probe:
+        config.probe_domains = False
     return config.validate()
 
 
@@ -228,12 +233,19 @@ async def run_headless(config: Config, cycles: Optional[int]) -> int:
             loop.add_signal_handler(signal_number, request_stop)
 
     stats = await collector.run(cycles=cycles)
-    logger.info(
-        "Finished: %d probed, %d responsive, %d unreachable, %d new, %d re-checked, "
-        "%d self-discovered, %d errors in %d cycle(s) (%.1f/s)",
-        stats.processed, stats.responsive, stats.unreachable, stats.new,
-        stats.rechecked, stats.discovered, stats.errors, stats.cycles, stats.rate,
-    )
+    if config.probe_domains:
+        logger.info(
+            "Finished: %d probed, %d responsive, %d unreachable, %d new, %d re-checked, "
+            "%d self-discovered, %d errors in %d cycle(s) (%.1f/s)",
+            stats.processed, stats.responsive, stats.unreachable, stats.new,
+            stats.rechecked, stats.discovered, stats.errors, stats.cycles, stats.rate,
+        )
+    else:
+        logger.info(
+            "Finished: %d recorded (not probed), %d already known, %d errors "
+            "in %d cycle(s) (%.1f/s)",
+            stats.new, stats.duplicates, stats.errors, stats.cycles, stats.rate,
+        )
     if stats.tech_counts:
         logger.info("Top technologies: %s", ", ".join(
             f"{name} ({count})" for name, count in stats.tech_counts.most_common(10)))

@@ -572,6 +572,13 @@ class Collector:
             fresh = await self.store.filter_new(normalised)
             self.stats.duplicates += len(normalised) - len(fresh)
 
+            if not self.config.probe_domains:
+                added = await self._record_unprobed(fresh, source.name)
+                queued += added
+                self._log(f"{source.name}: {added} new domains recorded",
+                          "GOOD" if added else "INFO")
+                continue
+
             added = 0
             for fingerprint in fresh:
                 if self._stop.is_set():
@@ -588,6 +595,39 @@ class Collector:
 
         self.stats.queued = self._queue.qsize()
         return queued + rechecked
+
+    async def _record_unprobed(self, fingerprints: Sequence[str], source_name: str) -> int:
+        """Store names without connecting to them.
+
+        Probing is the slow half of a cycle: a name costs one HTTP request and
+        its timeout, so the collector moves at a few names a second. Recording
+        alone is bounded by how fast the sources produce names, which is
+        thousands a second. The rows land with no status, no technologies and
+        a null checked_at, so enabling probing later picks them up as if they
+        had never been checked.
+        """
+        stored = 0
+        for fingerprint in fingerprints:
+            if self._stop.is_set():
+                break
+            if not self.store.reserve(fingerprint):
+                self.stats.duplicates += 1
+                continue
+            record = DomainRecord(
+                fingerprint=fingerprint,
+                raw=fingerprint,
+                responsive=False,
+                source=source_name,
+                probed=False,
+            )
+            if await self.store.add(record):
+                stored += 1
+                self.stats.new += 1
+            else:
+                self.stats.duplicates += 1
+                self.store.release(fingerprint)
+        self.stats.processed += stored
+        return stored
 
     async def _queue_rechecks(self) -> int:
         """Re-queue domains whose last check is older than ``recheck_after``."""

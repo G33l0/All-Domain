@@ -58,6 +58,9 @@ class DomainRecord:
     source: Optional[str] = None
     #: True when this record replaces an existing row (a scheduled re-check).
     recheck: bool = False
+    #: False for a name that was recorded without being connected to. Such a
+    #: row keeps a null checked_at so a later pass treats it as never checked.
+    probed: bool = True
 
 
 class DomainStore:
@@ -408,7 +411,7 @@ class DomainStore:
                     record.error,
                     record.elapsed_ms,
                     record.source,
-                    now,
+                    now if record.probed else None,
                 )
 
             rows = [values(record) for record in batch if not record.recheck]

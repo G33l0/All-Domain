@@ -461,3 +461,23 @@ def test_the_application_carries_the_brand_icon(window, qapp):
     assert sorted(s.width() for s in window.windowIcon().availableSizes()) == list(ICON_SIZES)
     # Safe to call anywhere; only Windows has a shell to tell.
     assert claim_windows_taskbar_identity() in (True, False)
+
+
+def test_recording_mode_round_trips_through_settings(window, tmp_path):
+    window.chk_no_probe.setChecked(True)
+    window.in_db.setText(str(tmp_path / "d.db"))
+    window.in_output.setText(str(tmp_path / "out"))
+    window._save_settings_form()
+    assert window.config.probe_domains is False
+
+    window.chk_no_probe.setChecked(False)
+    window._save_settings_form()
+    assert window.config.probe_domains is True
+
+
+def test_domains_page_defaults_to_one_row_per_site(window):
+    assert window.current_filter().sites_only is True
+    window.filter_grouping.setCurrentIndex(1)
+    assert window.current_filter().sites_only is False
+    window.clear_filters()
+    assert window.current_filter().sites_only is True

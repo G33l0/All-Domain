@@ -503,6 +503,12 @@ class MainWindow(QMainWindow):
         self.in_recheck_batch.setRange(1, 100_000)
         self.chk_recheck_only = QCheckBox("Re-check only")
         self.chk_recheck_only.setToolTip("Refresh stored domains without discovering new ones.")
+        self.chk_no_probe = QCheckBox("Record names without visiting them")
+        self.chk_no_probe.setToolTip(
+            "Collect names as fast as the sources produce them, around a hundred\n"
+            "times more per hour. Status and technology columns stay empty until\n"
+            "you turn this off and let the collector work through the backlog."
+        )
         self.chk_tech_files = QCheckBox("Write technology files")
         self.chk_tech_files.setToolTip("Append each live domain to output/<technology>.txt")
         self.chk_unresponsive = QCheckBox("Store unresponsive domains")
@@ -512,6 +518,7 @@ class MainWindow(QMainWindow):
         behaviour_form.addRow("Re-check after", self.in_recheck)
         behaviour_form.addRow("Re-checks per cycle", self.in_recheck_batch)
         behaviour_form.addRow("", self.chk_recheck_only)
+        behaviour_form.addRow("", self.chk_no_probe)
         behaviour_form.addRow("Database", self.in_db)
         behaviour_form.addRow("Output folder", self.in_output)
         behaviour_form.addRow("", self.chk_tech_files)
@@ -910,6 +917,7 @@ class MainWindow(QMainWindow):
         self.in_recheck.setValue(config.recheck_after)
         self.in_recheck_batch.setValue(config.recheck_batch)
         self.chk_recheck_only.setChecked(config.recheck_only)
+        self.chk_no_probe.setChecked(not config.probe_domains)
         self.chk_tech_files.setChecked(config.write_tech_files)
         self.chk_unresponsive.setChecked(config.store_unresponsive)
         self.chk_verify_ssl.setChecked(config.verify_ssl)
@@ -932,6 +940,7 @@ class MainWindow(QMainWindow):
         candidate.recheck_after = self.in_recheck.value()
         candidate.recheck_batch = self.in_recheck_batch.value()
         candidate.recheck_only = self.chk_recheck_only.isChecked()
+        candidate.probe_domains = not self.chk_no_probe.isChecked()
         candidate.write_tech_files = self.chk_tech_files.isChecked()
         candidate.store_unresponsive = self.chk_unresponsive.isChecked()
         candidate.verify_ssl = self.chk_verify_ssl.isChecked()
