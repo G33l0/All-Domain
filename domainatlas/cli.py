@@ -17,6 +17,7 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
+from .paths import ensure_streams, is_frozen, resolve
 from .export import FORMATS as EXPORT_FORMATS
 from .export import ExportError, export_to_path, format_for_path
 from .query import DomainFilter, DomainQuery, QueryError
@@ -25,6 +26,15 @@ from .sources import available_sources
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 DATE_FORMAT = "%H:%M:%S"
+
+
+def default_config_path(requested: str) -> str:
+    """Where settings live: beside the checkout, or in the user's data dir."""
+    if requested != DEFAULT_CONFIG_PATH:
+        return requested
+    if is_frozen():
+        return resolve(DEFAULT_CONFIG_PATH)
+    return requested
 
 
 def _theme_names() -> Sequence[str]:
@@ -81,6 +91,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="re-probe stored domains older than this (0 disables re-checking)")
     parser.add_argument("--recheck-batch", type=int, default=None, dest="recheck_batch",
                         metavar="N", help="how many stale domains to re-queue per cycle")
+    parser.add_argument("--no-probe", dest="no_probe", action="store_true",
+                        help="record every name a source reports without connecting to it: "
+                             "far more names per hour, no status or technology data")
     parser.add_argument("--recheck-only", action="store_true",
                         help="only re-check stored domains, do not discover new ones "
                              "(requires --recheck-after)")
@@ -119,6 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
                               help="only .onion domains")
     export_group.add_argument("--filter-clearnet", action="store_true",
                               help="exclude .onion domains")
+    export_group.add_argument("--sites-only", action="store_true",
+                              help="one row per site instead of one per host name "
+                                   "(example.com and www.example.com count once)")
     return parser
 
 
@@ -147,6 +163,7 @@ def filter_from_args(args: argparse.Namespace) -> DomainFilter:
         responsive=responsive,
         since=args.filter_since,
         onion=onion,
+        sites_only=bool(getattr(args, "sites_only", False)),
     )
 
 
@@ -170,12 +187,18 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> Config:
         config.use_builtwith = True
     if args.recheck_only:
         config.recheck_only = True
+    if args.no_probe:
+        config.probe_domains = False
     return config.validate()
 
 
 def _make_logger(level: str) -> logging.Logger:
     logging.basicConfig(level=getattr(logging, level, logging.INFO),
                         format=LOG_FORMAT, datefmt=DATE_FORMAT, stream=sys.stdout)
+    # Debug logging is for diagnosing the collector, not for a transcript of
+    # every statement the database and HTTP layers run.
+    for noisy in ("aiosqlite", "asyncio", "aiohttp", "websockets", "charset_normalizer"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
     return logging.getLogger("domain-atlas")
 
 
@@ -210,12 +233,19 @@ async def run_headless(config: Config, cycles: Optional[int]) -> int:
             loop.add_signal_handler(signal_number, request_stop)
 
     stats = await collector.run(cycles=cycles)
-    logger.info(
-        "Finished: %d probed, %d responsive, %d unreachable, %d new, %d re-checked, "
-        "%d self-discovered, %d errors in %d cycle(s) (%.1f/s)",
-        stats.processed, stats.responsive, stats.unreachable, stats.new,
-        stats.rechecked, stats.discovered, stats.errors, stats.cycles, stats.rate,
-    )
+    if config.probe_domains:
+        logger.info(
+            "Finished: %d probed, %d responsive, %d unreachable, %d new, %d re-checked, "
+            "%d self-discovered, %d errors in %d cycle(s) (%.1f/s)",
+            stats.processed, stats.responsive, stats.unreachable, stats.new,
+            stats.rechecked, stats.discovered, stats.errors, stats.cycles, stats.rate,
+        )
+    else:
+        logger.info(
+            "Finished: %d recorded (not probed), %d already known, %d errors "
+            "in %d cycle(s) (%.1f/s)",
+            stats.new, stats.duplicates, stats.errors, stats.cycles, stats.rate,
+        )
     if stats.tech_counts:
         logger.info("Top technologies: %s", ", ".join(
             f"{name} ({count})" for name, count in stats.tech_counts.most_common(10)))
@@ -279,7 +309,7 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
     want = args.ui
     if want in ("auto", "qt") and pyside_available():
         try:
-            return run_qt_gui(config, args.config, theme=args.theme)
+            return run_qt_gui(config, default_config_path(args.config), theme=args.theme)
         except Exception as exc:  # pragma: no cover - display problems
             print(f"Qt interface could not start ({exc}).", file=sys.stderr)
             if want == "qt":
@@ -299,7 +329,7 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
 
     if tkinter_available():
         try:
-            return run_gui(config, args.config)
+            return run_gui(config, default_config_path(args.config))
         except Exception as exc:  # pragma: no cover - display problems
             print(f"Tk interface could not start ({exc}).", file=sys.stderr)
             if want == "tk":
@@ -308,7 +338,7 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
         from .gui import run_gui as _run_gui
 
         try:
-            _run_gui(config, args.config)
+            _run_gui(config, default_config_path(args.config))
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
         return 1
@@ -319,6 +349,9 @@ def _run_desktop(args, config: Config, cycles: Optional[int]) -> Optional[int]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # A windowed build has no console: printing to a None stream would crash
+    # before anything useful happened.
+    ensure_streams()
     try:
         return _main(argv)
     except BrokenPipeError:
@@ -337,8 +370,10 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        config = Config.load(args.config)
+        config_path = default_config_path(args.config)
+        config = Config.load(config_path)
         config = apply_overrides(config, args)
+        config.resolve_paths()
     except ConfigError as exc:
         parser.error(str(exc))
         return 2  # pragma: no cover - argparse exits
@@ -348,13 +383,19 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         if args.theme not in valid:
             parser.error(f"--theme must be one of: {', '.join(valid)}")
 
+    known = set(available_sources())
+    unknown = [name for name in config.sources if name not in known]
+    if unknown:
+        parser.error("unknown source(s): %s; valid sources: %s"
+                     % (", ".join(unknown), ", ".join(available_sources())))
+
     if args.save_config:
         try:
-            config.save(args.config)
+            config.save(config_path)
         except ConfigError as exc:
             print(f"Could not save config: {exc}", file=sys.stderr)
             return 1
-        print(f"Configuration written to {args.config}")
+        print(f"Configuration written to {config_path}")
         return 0
 
     try:

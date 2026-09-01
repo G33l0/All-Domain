@@ -9,6 +9,7 @@ from aiohttp import web
 
 from domainatlas.config import Config
 from domainatlas.engine import Collector, probe_domain
+from domainatlas.query import DomainFilter, DomainQuery
 from domainatlas.sources import Source
 from domainatlas.store import DomainStore
 
@@ -586,3 +587,43 @@ async def test_an_empty_source_is_not_put_on_cooldown(tmp_path):
     stats = await _run_one_cycle(collector, probe)
     assert source.calls == 2
     assert stats.processed == 1
+
+
+@pytest.mark.asyncio
+async def test_recording_without_probing_never_touches_the_network(tmp_path, monkeypatch):
+    """Discovery-only mode is the fast path: names in, no requests out."""
+    from domainatlas import engine as engine_module
+
+    async def fail(*args, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("probe_domain was called with probing disabled")
+
+    monkeypatch.setattr(engine_module, "probe_domain", fail)
+
+    config = Config(
+        db_path=str(tmp_path / "d.db"), output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"), sources=["file"],
+        seed_file=str(tmp_path / "seeds.txt"), max_domains_per_cycle=4,
+        probe_domains=False, write_tech_files=False,
+    )
+    (tmp_path / "seeds.txt").write_text("a.example\nwww.a.example\nb.example\nc.example\n")
+    config.validate()
+
+    collector = engine_module.Collector(config)
+    stats = await collector.run(cycles=1)
+    assert stats.new == 4
+
+    query = DomainQuery(config.db_path).open()
+    try:
+        rows = query.page(DomainFilter(), limit=10)
+        assert sorted(row.fingerprint for row in rows) == [
+            "a.example", "b.example", "c.example", "www.a.example"
+        ]
+        # Never checked, so a later probing run treats them as new work.
+        assert all(row.checked_at is None for row in rows)
+        assert all(row.status_code is None for row in rows)
+        grouped = query.page(DomainFilter(sites_only=True), limit=10)
+        assert sorted(row.fingerprint for row in grouped) == [
+            "a.example", "b.example", "c.example"
+        ]
+    finally:
+        query.close()

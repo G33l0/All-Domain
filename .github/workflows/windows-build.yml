@@ -1,0 +1,90 @@
+name: Windows build
+
+# Produces a signed-free, ready-to-run Windows installer so users need neither
+# Python nor Git. Runs on every push to the branch and attaches the installer
+# to any tagged release.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pytest pytest-asyncio
+
+      - name: Run the test suite
+        run: python -m pytest -q
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Generate the application icon
+        run: python packaging/make_icons.py
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Build the application
+        run: pyinstaller packaging/domain-atlas.spec --noconfirm
+
+      - name: Smoke test the frozen build
+        run: |
+          .\dist\DomainAtlas\domain-atlas-cli.exe --version
+          .\dist\DomainAtlas\domain-atlas-cli.exe --headless --once --limit 5 --timeout 8 --sources tranco
+          .\dist\DomainAtlas\domain-atlas-cli.exe --stats
+
+      - name: Read the version
+        id: version
+        shell: bash
+        run: echo "value=$(python -c 'import domainatlas; print(domainatlas.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Build the installer
+        run: |
+          $iscc = Get-ChildItem -Path "${env:ProgramFiles(x86)}", "${env:ProgramFiles}" `
+              -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          if (-not $iscc) {
+            Write-Host "Inno Setup not present on the runner; installing it"
+            choco install innosetup --no-progress -y
+            $iscc = Get-ChildItem -Path "${env:ProgramFiles(x86)}", "${env:ProgramFiles}" `
+                -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $iscc) { throw "ISCC.exe could not be located" }
+          Write-Host "Using $iscc"
+          & $iscc /DAppVersion=${{ steps.version.outputs.value }} packaging\domain-atlas.iss
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DomainAtlas-Setup-${{ steps.version.outputs.value }}
+          path: packaging/output/*.exe
+          if-no-files-found: error
+
+      - name: Upload the portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DomainAtlas-portable-${{ steps.version.outputs.value }}
+          path: dist/DomainAtlas/
+
+      - name: Attach the installer to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/output/*.exe
+          generate_release_notes: true

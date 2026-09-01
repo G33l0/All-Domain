@@ -9,17 +9,18 @@ no domain is probed twice.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import aiosqlite
 
-SCHEMA_VERSION = 2
+from .domains import site_of, site_rank
+
+SCHEMA_VERSION = 4
 
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9 ._+-]")
 _RESERVED_WINDOWS_NAMES = {
@@ -45,7 +46,6 @@ class DomainRecord:
     """One probed domain, ready to be persisted."""
 
     fingerprint: str
-    raw: str
     responsive: bool = False
     technologies: List[str] = field(default_factory=list)
     versions: Dict[str, str] = field(default_factory=dict)
@@ -56,6 +56,9 @@ class DomainRecord:
     source: Optional[str] = None
     #: True when this record replaces an existing row (a scheduled re-check).
     recheck: bool = False
+    #: False for a name that was recorded without being connected to. Such a
+    #: row keeps a null checked_at so a later pass treats it as never checked.
+    probed: bool = True
 
 
 class DomainStore:
@@ -90,6 +93,7 @@ class DomainStore:
         self._reserved: Set[str] = set()
         self._pending: List[DomainRecord] = []
         self._flush_lock = asyncio.Lock()
+        self._tech_ids_cache: Dict[str, int] = {}
         self._file_lock = asyncio.Lock()
         self._flusher: Optional[asyncio.Task] = None
         self._closed = False
@@ -159,10 +163,8 @@ class DomainStore:
             """
             CREATE TABLE IF NOT EXISTS domains (
                 fingerprint TEXT PRIMARY KEY,
-                raw         TEXT NOT NULL,
                 first_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                responsive  INTEGER NOT NULL DEFAULT 0,
-                technologies TEXT
+                responsive  INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -177,6 +179,8 @@ class DomainStore:
             ("elapsed_ms", "ALTER TABLE domains ADD COLUMN elapsed_ms INTEGER"),
             ("source", "ALTER TABLE domains ADD COLUMN source TEXT"),
             ("checked_at", "ALTER TABLE domains ADD COLUMN checked_at TIMESTAMP"),
+            ("site", "ALTER TABLE domains ADD COLUMN site TEXT"),
+            ("is_primary", "ALTER TABLE domains ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 1"),
         ):
             if column not in existing:
                 await self._db.execute(ddl)
@@ -189,30 +193,63 @@ class DomainStore:
             )
             """
         )
+        # Technology names are interned. Storing the domain name and the
+        # technology name in full on every pairing made this table and its
+        # indexes half the database; two integers per pairing is a fraction of
+        # that, and the counts a listing needs are maintained rather than
+        # recomputed by scanning the whole table.
         await self._db.execute(
             """
-            CREATE TABLE IF NOT EXISTS domain_tech (
-                fingerprint TEXT NOT NULL,
-                technology  TEXT NOT NULL,
-                version     TEXT,
-                PRIMARY KEY (fingerprint, technology)
+            CREATE TABLE IF NOT EXISTS technologies (
+                id   INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
             )
             """
         )
-        tech_columns = set()
-        async with self._db.execute("PRAGMA table_info(domain_tech)") as cursor:
-            async for row in cursor:
-                tech_columns.add(row[1])
-        if "version" not in tech_columns:
-            await self._db.execute("ALTER TABLE domain_tech ADD COLUMN version TEXT")
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tech_counts (
+                tech_id INTEGER PRIMARY KEY,
+                domains INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        # Totals for the dashboard. Counting rows instead is a full scan, which
+        # is milliseconds at a million domains and many seconds at a hundred
+        # million, on a panel that refreshes while a run is going.
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS totals (
+                name  TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS domain_tech (
+                domain_id INTEGER NOT NULL,
+                tech_id   INTEGER NOT NULL,
+                version   TEXT,
+                PRIMARY KEY (domain_id, tech_id)
+            ) WITHOUT ROWID
+            """
+        )
+        await self._upgrade_domain_tech()
         for statement in (
             "CREATE INDEX IF NOT EXISTS idx_domains_responsive ON domains(responsive)",
             "CREATE INDEX IF NOT EXISTS idx_domains_source ON domains(source)",
             "CREATE INDEX IF NOT EXISTS idx_domains_first_seen ON domains(first_seen, fingerprint)",
             "CREATE INDEX IF NOT EXISTS idx_domains_checked_at ON domains(checked_at)",
-            "CREATE INDEX IF NOT EXISTS idx_domain_tech_tech ON domain_tech(technology)",
+            "CREATE INDEX IF NOT EXISTS idx_domain_tech_tech ON domain_tech(tech_id, domain_id)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_site ON domains(site)",
+            "CREATE INDEX IF NOT EXISTS idx_domains_primary "
+            "ON domains(is_primary, first_seen, fingerprint)",
         ):
             await self._db.execute(statement)
+        await self._drop_duplicated_columns()
+        await self._backfill_sites()
+        await self._recount_totals_if_missing()
         # Rows written before first_seen had a default would otherwise need a
         # slower NULL-aware ordering on every read.
         await self._db.execute(
@@ -221,6 +258,237 @@ class DomainStore:
         )
         await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         await self._db.commit()
+
+    async def _upgrade_domain_tech(self) -> None:
+        """Convert a name-keyed domain_tech table to the interned one.
+
+        Runs once, on a database written before technology names were interned.
+        The old table is read through the domains table so each pairing picks
+        up the integer row id SQLite already keeps for its domain.
+        """
+        assert self._db is not None
+        columns = set()
+        async with self._db.execute("PRAGMA table_info(domain_tech)") as cursor:
+            async for row in cursor:
+                columns.add(row[1])
+        if "fingerprint" not in columns:
+            await self._refresh_tech_counts_if_empty()
+            return
+
+        await self._db.execute("DROP INDEX IF EXISTS idx_domain_tech_tech")
+        await self._db.execute("ALTER TABLE domain_tech RENAME TO domain_tech_legacy")
+        await self._db.execute(
+            """
+            CREATE TABLE domain_tech (
+                domain_id INTEGER NOT NULL,
+                tech_id   INTEGER NOT NULL,
+                version   TEXT,
+                PRIMARY KEY (domain_id, tech_id)
+            ) WITHOUT ROWID
+            """
+        )
+        await self._db.execute(
+            "INSERT OR IGNORE INTO technologies (name) "
+            "SELECT DISTINCT technology FROM domain_tech_legacy"
+        )
+        await self._db.execute(
+            """
+            INSERT OR IGNORE INTO domain_tech (domain_id, tech_id, version)
+            SELECT d.rowid, t.id, l.version
+            FROM domain_tech_legacy l
+            JOIN domains d ON d.fingerprint = l.fingerprint
+            JOIN technologies t ON t.name = l.technology
+            """
+        )
+        await self._db.execute("DROP TABLE domain_tech_legacy")
+        await self._recount_technologies()
+        await self._db.commit()
+
+    TOTALS = ("domains", "responsive", "onion")
+
+    async def _recount_totals_if_missing(self) -> None:
+        """Seed the totals table, once, from the rows it summarises."""
+        assert self._db is not None
+        async with self._db.execute("SELECT COUNT(*) FROM totals") as cursor:
+            row = await cursor.fetchone()
+        if row and int(row[0]) == len(self.TOTALS):
+            return
+        await self._recount_totals()
+
+    async def _recount_totals(self) -> None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(responsive), 0), "
+            "       COALESCE(SUM(fingerprint LIKE '%.onion'), 0) FROM domains"
+        ) as cursor:
+            row = await cursor.fetchone()
+        values = [int(value) for value in (row or (0, 0, 0))]
+        await self._db.executemany(
+            "INSERT INTO totals (name, value) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            list(zip(self.TOTALS, values)),
+        )
+        await self._db.commit()
+
+    async def _bump_totals(self, deltas: Dict[str, int]) -> None:
+        assert self._db is not None
+        changed = [(name, delta) for name, delta in deltas.items() if delta]
+        if not changed:
+            return
+        await self._db.executemany(
+            "INSERT INTO totals (name, value) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value = MAX(0, value + excluded.value)",
+            changed,
+        )
+
+    async def _refresh_tech_counts_if_empty(self) -> None:
+        """Populate the counter table the first time it appears."""
+        assert self._db is not None
+        async with self._db.execute("SELECT 1 FROM tech_counts LIMIT 1") as cursor:
+            if await cursor.fetchone():
+                return
+        async with self._db.execute("SELECT 1 FROM domain_tech LIMIT 1") as cursor:
+            if not await cursor.fetchone():
+                return
+        await self._recount_technologies()
+        await self._db.commit()
+
+    async def _recount_technologies(self) -> None:
+        """Rebuild the counter table from the pairings it summarises."""
+        assert self._db is not None
+        await self._db.execute("DELETE FROM tech_counts")
+        await self._db.execute(
+            "INSERT INTO tech_counts (tech_id, domains) "
+            "SELECT tech_id, COUNT(*) FROM domain_tech GROUP BY tech_id"
+        )
+
+    async def _drop_duplicated_columns(self) -> None:
+        """Remove the two columns that repeated data held elsewhere.
+
+        ``raw`` always held the same string as ``fingerprint``, and
+        ``technologies`` held a JSON copy of the domain_tech pairings. Between
+        them they were a fifth of the file. The table is rebuilt once; the
+        pairings key on fingerprint, so reassigned row ids do not matter as
+        long as domain_tech is remapped afterwards.
+        """
+        assert self._db is not None
+        columns = set()
+        async with self._db.execute("PRAGMA table_info(domains)") as cursor:
+            async for row in cursor:
+                columns.add(row[1])
+        if not ({"raw", "technologies"} & columns):
+            return
+        await self._db.execute("PRAGMA foreign_keys=OFF")
+        await self._db.execute(
+            """
+            CREATE TABLE domains_rebuilt (
+                fingerprint TEXT PRIMARY KEY,
+                first_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                responsive  INTEGER NOT NULL DEFAULT 0,
+                status_code INTEGER,
+                scheme      TEXT,
+                error       TEXT,
+                elapsed_ms  INTEGER,
+                source      TEXT,
+                checked_at  TIMESTAMP,
+                site        TEXT,
+                is_primary  INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        await self._db.execute(
+            """
+            INSERT INTO domains_rebuilt
+                (fingerprint, first_seen, responsive, status_code, scheme, error,
+                 elapsed_ms, source, checked_at, site, is_primary)
+            SELECT fingerprint, first_seen, responsive, status_code, scheme, error,
+                   elapsed_ms, source, checked_at, site, is_primary FROM domains
+            """
+        )
+        # domain_tech points at row ids the rebuild reassigns, so carry the
+        # pairings across by name before the old table goes away.
+        await self._db.execute(
+            """
+            CREATE TEMPORARY TABLE tech_by_name AS
+            SELECT d.fingerprint AS fingerprint, dt.tech_id AS tech_id, dt.version AS version
+            FROM domain_tech dt JOIN domains d ON d.rowid = dt.domain_id
+            """
+        )
+        await self._db.execute("DROP TABLE domains")
+        await self._db.execute("ALTER TABLE domains_rebuilt RENAME TO domains")
+        await self._db.execute("DELETE FROM domain_tech")
+        await self._db.execute(
+            """
+            INSERT OR IGNORE INTO domain_tech (domain_id, tech_id, version)
+            SELECT d.rowid, n.tech_id, n.version
+            FROM tech_by_name n JOIN domains d ON d.fingerprint = n.fingerprint
+            """
+        )
+        await self._db.execute("DROP TABLE tech_by_name")
+        await self._db.execute("PRAGMA foreign_keys=ON")
+        await self._db.commit()
+
+    async def _backfill_sites(self) -> None:
+        """Fill in the site of rows written before the column existed."""
+        assert self._db is not None
+        while True:
+            async with self._db.execute(
+                "SELECT fingerprint FROM domains WHERE site IS NULL LIMIT 20000"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            if not rows:
+                break
+            await self._db.executemany(
+                "UPDATE domains SET site = ? WHERE fingerprint = ?",
+                [(site_of(name), name) for (name,) in rows],
+            )
+            await self._db.commit()
+            await self._reconcile_sites({site_of(name) for (name,) in rows})
+
+    async def _reconcile_sites(self, sites: Set[str]) -> None:
+        """Elect one representative host per site.
+
+        The listing shows a site once rather than once per host name, so
+        ``example.com`` and ``www.example.com`` do not read as two results.
+        The winner is the shortest name, which is always the apex; ordering by
+        name alone would pick whichever variant sorted first, and the choice
+        does not drift as more variants arrive.
+
+        Only the sites this batch touched are read, and only the rows whose
+        flag is actually wrong are written, so a bulk load does not rewrite
+        rows it has already settled.
+        """
+        assert self._db is not None
+        names = [site for site in sites if site]
+        if not names:
+            return
+        for start in range(0, len(names), 400):
+            chunk = names[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            members: Dict[str, List[Tuple[str, int]]] = {}
+            async with self._db.execute(
+                f"SELECT site, fingerprint, is_primary FROM domains "
+                f"WHERE site IN ({placeholders})",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    members.setdefault(row[0], []).append((row[1], int(row[2])))
+            promote, demote = [], []
+            for hosts in members.values():
+                best = min(hosts, key=lambda entry: site_rank(entry[0]))[0]
+                for host, is_primary in hosts:
+                    if host == best and not is_primary:
+                        promote.append(host)
+                    elif host != best and is_primary:
+                        demote.append(host)
+            for value, changed in ((0, demote), (1, promote)):
+                for offset in range(0, len(changed), 400):
+                    piece = changed[offset:offset + 400]
+                    await self._db.execute(
+                        f"UPDATE domains SET is_primary = {value} "
+                        f"WHERE fingerprint IN ({','.join('?' * len(piece))})",
+                        piece,
+                    )
 
     # ------------------------------------------------------------ dedup logic
     def _remember(self, fingerprint: str) -> None:
@@ -339,64 +607,77 @@ class DomainStore:
             def values(record: DomainRecord):
                 return (
                     record.fingerprint,
-                    record.raw,
+                    site_of(record.fingerprint),
                     1 if record.responsive else 0,
-                    json.dumps(record.technologies) if record.technologies else None,
                     record.status_code,
                     record.scheme,
                     record.error,
                     record.elapsed_ms,
                     record.source,
-                    now,
+                    now if record.probed else None,
                 )
 
             rows = [values(record) for record in batch if not record.recheck]
             updates = [values(record)[2:] + (record.fingerprint,) for record in batch if record.recheck]
+            new_sites = {row[1] for row in rows}
             rechecked = [record.fingerprint for record in batch if record.recheck]
-            tech_rows = [
-                (record.fingerprint, technology, record.versions.get(technology) or None)
-                for record in batch
-                for technology in record.technologies
-            ]
             previous_pairs: Set[Tuple[str, str]] = set()
             if rechecked and self.write_tech_files:
-                placeholders = ",".join("?" * len(rechecked))
-                async with self._db.execute(
-                    f"SELECT fingerprint, technology FROM domain_tech WHERE fingerprint IN ({placeholders})",
-                    rechecked,
-                ) as cursor:
-                    previous_pairs = {(row[0], row[1]) async for row in cursor}
+                previous_pairs = await self._pairs_for(rechecked)
+            # A re-check can flip a domain between live and down, so the
+            # running totals need the value it is replacing.
+            was_responsive = 0
+            if rechecked:
+                for start in range(0, len(rechecked), 400):
+                    chunk = rechecked[start:start + 400]
+                    placeholders = ",".join("?" * len(chunk))
+                    async with self._db.execute(
+                        f"SELECT COALESCE(SUM(responsive), 0) FROM domains "
+                        f"WHERE fingerprint IN ({placeholders})",
+                        chunk,
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    was_responsive += int(row[0]) if row else 0
             try:
+                before_insert = self._db.total_changes
+                inserted = 0
                 if rows:
                     await self._db.executemany(
                         """
                         INSERT OR IGNORE INTO domains
-                            (fingerprint, raw, responsive, technologies, status_code,
+                            (fingerprint, site, responsive, status_code,
                              scheme, error, elapsed_ms, source, checked_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         rows,
                     )
+                    inserted = self._db.total_changes - before_insert
+                    await self._reconcile_sites(new_sites)
                 if updates:
                     await self._db.executemany(
                         """
-                        UPDATE domains SET responsive = ?, technologies = ?, status_code = ?,
+                        UPDATE domains SET responsive = ?, status_code = ?,
                                scheme = ?, error = ?, elapsed_ms = ?, source = ?, checked_at = ?
                         WHERE fingerprint = ?
                         """,
                         updates,
                     )
                     # Technologies can disappear between checks - replace, do not merge.
-                    await self._db.executemany(
-                        "DELETE FROM domain_tech WHERE fingerprint = ?",
-                        [(fingerprint,) for fingerprint in rechecked],
-                    )
-                if tech_rows:
-                    await self._db.executemany(
-                        "INSERT OR IGNORE INTO domain_tech (fingerprint, technology, version) "
-                        "VALUES (?, ?, ?)",
-                        tech_rows,
-                    )
+                    await self._clear_technologies(rechecked)
+                await self._write_technologies(batch)
+                # INSERT OR IGNORE can skip a row another writer got to first,
+                # so the totals follow what the database actually accepted.
+                if inserted:
+                    accepted = rows[:inserted] if inserted < len(rows) else rows
+                    await self._bump_totals({
+                        "domains": inserted,
+                        "responsive": sum(row[2] for row in accepted),
+                        "onion": sum(1 for row in accepted if row[0].endswith(".onion")),
+                    })
+                if updates:
+                    await self._bump_totals({
+                        "responsive": sum(update[0] for update in updates) - was_responsive,
+                    })
                 await self._db.commit()
             except Exception:
                 # Put the batch back so nothing is silently lost.
@@ -405,6 +686,147 @@ class DomainStore:
             if self.write_tech_files:
                 await self._write_tech_files(batch, previous_pairs)
             return len(batch)
+
+    async def _tech_ids(self, names: Sequence[str]) -> Dict[str, int]:
+        """Intern technology names, returning their ids."""
+        assert self._db is not None
+        wanted = {name for name in names if name}
+        if not wanted:
+            return {}
+        missing = [name for name in wanted if name not in self._tech_ids_cache]
+        if missing:
+            await self._db.executemany(
+                "INSERT OR IGNORE INTO technologies (name) VALUES (?)",
+                [(name,) for name in missing],
+            )
+            for start in range(0, len(missing), 400):
+                chunk = missing[start:start + 400]
+                placeholders = ",".join("?" * len(chunk))
+                async with self._db.execute(
+                    f"SELECT name, id FROM technologies WHERE name IN ({placeholders})", chunk
+                ) as cursor:
+                    async for row in cursor:
+                        self._tech_ids_cache[row[0]] = int(row[1])
+        return {name: self._tech_ids_cache[name] for name in wanted
+                if name in self._tech_ids_cache}
+
+    async def _domain_ids(self, fingerprints: Sequence[str]) -> Dict[str, int]:
+        """Row ids for stored domains, looked up a chunk at a time."""
+        assert self._db is not None
+        found: Dict[str, int] = {}
+        names = list({name for name in fingerprints if name})
+        for start in range(0, len(names), 400):
+            chunk = names[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            async with self._db.execute(
+                f"SELECT fingerprint, rowid FROM domains WHERE fingerprint IN ({placeholders})",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    found[row[0]] = int(row[1])
+        return found
+
+    async def _pairs_for(self, fingerprints: Sequence[str]) -> Set[Tuple[str, str]]:
+        """``(domain, technology)`` pairings currently stored for *fingerprints*."""
+        assert self._db is not None
+        ids = await self._domain_ids(fingerprints)
+        if not ids:
+            return set()
+        by_id = {value: key for key, value in ids.items()}
+        pairs: Set[Tuple[str, str]] = set()
+        values = list(by_id)
+        for start in range(0, len(values), 400):
+            chunk = values[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            async with self._db.execute(
+                f"SELECT dt.domain_id, t.name FROM domain_tech dt "
+                f"JOIN technologies t ON t.id = dt.tech_id "
+                f"WHERE dt.domain_id IN ({placeholders})",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    pairs.add((by_id[int(row[0])], row[1]))
+        return pairs
+
+    async def _clear_technologies(self, fingerprints: Sequence[str]) -> None:
+        """Drop the pairings for *fingerprints*, keeping the counters in step."""
+        assert self._db is not None
+        ids = await self._domain_ids(fingerprints)
+        if not ids:
+            return
+        values = list(ids.values())
+        for start in range(0, len(values), 400):
+            chunk = values[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            await self._db.execute(
+                f"UPDATE tech_counts SET domains = MAX(0, domains - ("
+                f"  SELECT COUNT(*) FROM domain_tech dt"
+                f"  WHERE dt.tech_id = tech_counts.tech_id"
+                f"    AND dt.domain_id IN ({placeholders})))"
+                f"WHERE tech_id IN ("
+                f"  SELECT tech_id FROM domain_tech WHERE domain_id IN ({placeholders}))",
+                chunk + chunk,
+            )
+            await self._db.execute(
+                f"DELETE FROM domain_tech WHERE domain_id IN ({placeholders})", chunk
+            )
+
+    async def _write_technologies(self, batch: Sequence[DomainRecord]) -> None:
+        """Store this batch's technology pairings and bump the counters.
+
+        The counts shown on the Technologies page are maintained here rather
+        than recomputed: counting the pairings is a full scan of the largest
+        table, which is a fraction of a second at a million domains and many
+        seconds at a hundred million.
+        """
+        assert self._db is not None
+        wanted = [record for record in batch if record.technologies]
+        if not wanted:
+            return
+        tech_ids = await self._tech_ids(
+            [name for record in wanted for name in record.technologies]
+        )
+        domain_ids = await self._domain_ids([record.fingerprint for record in wanted])
+        pairs = []
+        for record in wanted:
+            domain_id = domain_ids.get(record.fingerprint)
+            if domain_id is None:
+                continue
+            for name in record.technologies:
+                tech_id = tech_ids.get(name)
+                if tech_id is not None:
+                    pairs.append((domain_id, tech_id, record.versions.get(name) or None))
+        if not pairs:
+            return
+        # Only pairings that are actually new may increment a counter.
+        existing = set()
+        for start in range(0, len(pairs), 400):
+            chunk = pairs[start:start + 400]
+            placeholders = ",".join("(?,?)" for _ in chunk)
+            flat: List[Any] = []
+            for domain_id, tech_id, _version in chunk:
+                flat.extend((domain_id, tech_id))
+            async with self._db.execute(
+                f"SELECT domain_id, tech_id FROM domain_tech "
+                f"WHERE (domain_id, tech_id) IN ({placeholders})",
+                flat,
+            ) as cursor:
+                async for row in cursor:
+                    existing.add((int(row[0]), int(row[1])))
+        await self._db.executemany(
+            "INSERT OR IGNORE INTO domain_tech (domain_id, tech_id, version) VALUES (?, ?, ?)",
+            pairs,
+        )
+        added: Dict[int, int] = {}
+        for domain_id, tech_id, _version in pairs:
+            if (domain_id, tech_id) not in existing:
+                added[tech_id] = added.get(tech_id, 0) + 1
+        if added:
+            await self._db.executemany(
+                "INSERT INTO tech_counts (tech_id, domains) VALUES (?, ?) "
+                "ON CONFLICT(tech_id) DO UPDATE SET domains = domains + excluded.domains",
+                list(added.items()),
+            )
 
     async def _write_tech_files(
         self, batch: Sequence[DomainRecord], already_written: Optional[Set[Tuple[str, str]]] = None
@@ -417,7 +839,7 @@ class DomainStore:
             for technology in record.technologies:
                 if (record.fingerprint, technology) in already_written:
                     continue  # a re-check that found the same technology again
-                grouped.setdefault(safe_filename(technology), []).append(record.raw)
+                grouped.setdefault(safe_filename(technology), []).append(record.fingerprint)
         if not grouped:
             return
         async with self._file_lock:
@@ -533,15 +955,17 @@ class DomainStore:
         """Totals straight from the database."""
         await self.flush()
         assert self._db is not None
+        totals = {name: 0 for name in self.TOTALS}
+        async with self._db.execute("SELECT name, value FROM totals") as cursor:
+            async for row in cursor:
+                totals[row[0]] = int(row[1])
         async with self._db.execute(
-            "SELECT COUNT(*) AS total, COALESCE(SUM(responsive), 0) AS responsive FROM domains"
+            "SELECT COUNT(*) FROM tech_counts WHERE domains > 0"
         ) as cursor:
-            row = await cursor.fetchone()
-        async with self._db.execute("SELECT COUNT(DISTINCT technology) FROM domain_tech") as cursor:
             tech_row = await cursor.fetchone()
         return {
-            "total": int(row["total"] if row else 0),
-            "responsive": int(row["responsive"] if row else 0),
+            "total": totals["domains"],
+            "responsive": totals["responsive"],
             "technologies": int(tech_row[0] if tech_row else 0),
         }
 
@@ -549,8 +973,9 @@ class DomainStore:
         await self.flush()
         assert self._db is not None
         async with self._db.execute(
-            "SELECT technology, COUNT(*) AS hits FROM domain_tech "
-            "GROUP BY technology ORDER BY hits DESC, technology ASC LIMIT ?",
+            "SELECT t.name, c.domains FROM tech_counts c "
+            "JOIN technologies t ON t.id = c.tech_id "
+            "WHERE c.domains > 0 ORDER BY c.domains DESC, t.name ASC LIMIT ?",
             (int(limit),),
         ) as cursor:
             return [(row[0], int(row[1])) async for row in cursor]
@@ -559,8 +984,10 @@ class DomainStore:
         await self.flush()
         assert self._db is not None
         async with self._db.execute(
-            "SELECT d.raw FROM domain_tech t JOIN domains d ON d.fingerprint = t.fingerprint "
-            "WHERE t.technology = ? ORDER BY d.raw LIMIT ?",
+            "SELECT d.fingerprint FROM domain_tech dt "
+            "JOIN domains d ON d.rowid = dt.domain_id "
+            "JOIN technologies t ON t.id = dt.tech_id "
+            "WHERE t.name = ? ORDER BY d.fingerprint LIMIT ?",
             (technology, int(limit)),
         ) as cursor:
             return [row[0] async for row in cursor]

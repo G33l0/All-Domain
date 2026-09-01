@@ -144,6 +144,15 @@ def test_theme_names_are_validated(capsys):
     assert "--theme must be one of" in capsys.readouterr().err
 
 
+def test_unknown_sources_are_refused_before_the_run(workdir, capsys):
+    """A typo in --sources should read as a usage error, not a traceback."""
+    with pytest.raises(SystemExit):
+        main(["--headless", "--once", "--sources", "self,bogus"])
+    message = capsys.readouterr().err
+    assert "unknown source(s): bogus" in message
+    assert "valid sources:" in message
+
+
 def test_a_closed_pipe_does_not_raise(workdir, monkeypatch, capsys):
     """`domain-atlas --stats | head` must exit quietly, not traceback."""
     import sqlite3

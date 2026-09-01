@@ -11,8 +11,9 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/ui-PySide6%20%2F%20Qt%206-41cd52.svg" alt="PySide6">
-  <img src="https://img.shields.io/badge/tests-245%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-259%20passing-brightgreen.svg" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT">
+  <img src="https://img.shields.io/badge/windows-installer-0078d4.svg" alt="Windows installer">
 </p>
 
 <p align="center">
@@ -34,18 +35,45 @@ from a terminal.
   frameworks, JavaScript libraries, analytics and security headers, with version capture,
   derived from response headers, cookies, meta tags and HTML.
 - **Deduplicated inventory** — a domain is probed once and stored once, enforced both in
-  memory and by the database schema.
+  memory and by the database schema. Host variants of one site are collapsed by default,
+  so `example.com` and `www.example.com` are a single result with a host count rather
+  than two rows that look like two findings.
+- **Recording mode** — `--no-probe` stores every name a source reports without connecting
+  to it, which measured 4.3 names a second probing against 522 recording.
 - **Scheduled re-checks** — stored domains can be re-probed on an interval, updating
   their record in place rather than duplicating it.
 - **Tor support** — `.onion` addresses are discovered and stored on the clear web, and
   probed through a SOCKS5 proxy when one is configured.
 - **Filtered export** — CSV, JSON, JSON Lines or plain domain lists, filtered by
   technology, source, status, network or first-seen date, streamed from disk.
-- **Scales to large inventories** — the desktop table pages through a multi-million row
-  database with keyset pagination; every query runs off the UI thread.
+- **Built for a large inventory** — 449 bytes a domain, keyset pagination so page 10,000
+  costs what page 1 costs, capped counts, and aggregates maintained as rows are written
+  rather than recomputed. Every query runs off the UI thread. See
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Six themes** — Light, Dark, Midnight, Aurora, Amber and a monospaced Hacker theme.
 
 ## Installation
+
+### Windows: install the application
+
+Download `DomainAtlas-Setup-<version>.exe` from the
+[latest release](https://github.com/G33l0/All-Domain/releases) and run it.
+Nothing else is required — Python and Qt are bundled. The default is a per-user
+install, so no administrator prompt appears; choosing "for all users" installs
+to Program Files instead.
+
+The installer places two programs side by side:
+
+| | |
+| --- | --- |
+| `DomainAtlas.exe` | the desktop application |
+| `domain-atlas-cli.exe` | the same program with a console, for `--headless` and exports |
+
+Collected data is written to `%LOCALAPPDATA%\Domain Atlas`, never to the
+installation directory, so the application works normally when installed to a
+read-only location. Uninstalling leaves that data in place.
+
+### From source
 
 ```bash
 git clone https://github.com/G33l0/All-Domain.git
@@ -119,6 +147,7 @@ python domain_atlas.py --export - --filter-source certstream --filter-since 2026
 | `--tor-proxy URL` | SOCKS5 proxy for `.onion` probing |
 | `--recheck-after SECONDS` | Re-probe records older than this (`0` disables) |
 | `--recheck-batch N`, `--recheck-only` | Re-check volume, and re-check without discovery |
+| `--no-probe` | Record every name a source reports without connecting to it |
 | `--db PATH`, `--output DIR` | Database and technology-file locations |
 | `--responsive-only`, `--no-tech-files` | Storage behaviour |
 | `--verify-ssl` | Verify TLS certificates (off by default) |
@@ -127,6 +156,7 @@ python domain_atlas.py --export - --filter-source certstream --filter-since 2026
 | `--export-format` | `csv`, `json`, `jsonl`, `txt` (default: from the file extension) |
 | `--filter-technology`, `--filter-source`, `--filter-contains`, `--filter-since` | Export filters |
 | `--filter-live`, `--filter-down`, `--filter-onion`, `--filter-clearnet` | Export filters |
+| `--sites-only` | One row per site instead of one per host name |
 | `--save-config` | Write the resulting settings to the config file and exit |
 
 ## Desktop application
@@ -173,16 +203,23 @@ page scrolls. The window can shrink to 820x460 logical pixels, which fits a
 
 The theme follows the operating system by default and can be changed from the sidebar.
 
-### Building a Windows executable
+### Building the Windows installer
+
+Every push builds and tests the application on a Windows runner and uploads the
+installer as a workflow artifact; tagging a release attaches it to the release. To
+build locally:
 
 ```powershell
 pip install pyinstaller PySide6
 python packaging/make_icons.py
-pyinstaller packaging/domain-atlas.spec
+pyinstaller packaging/domain-atlas.spec --noconfirm
+iscc packaging\domain-atlas.iss
 ```
 
-Produces `dist/DomainAtlas.exe`, a single file with no console window. The same binary
-accepts `--headless` for command line use.
+The first command produces `dist/DomainAtlas/`, a self-contained folder holding both
+executables, and the second wraps it in `packaging/output/DomainAtlas-Setup-<version>.exe`.
+A folder build rather than a single file keeps start-up fast: a one-file build unpacks
+its whole payload on every launch.
 
 ## Configuration
 
@@ -253,6 +290,7 @@ python domain_atlas.py --headless --sources self
 ```
 domainatlas/
   cli.py        command line entry point and argument handling
+  paths.py      file locations, including installed builds
   config.py     validated settings, loaded from and saved to JSON
   ctlog.py      Certificate Transparency reading and certificate parsing
   domains.py    parsing, validation and normalisation of host names
@@ -280,12 +318,23 @@ with keyset pagination, so page 10,000 costs the same as page 1.
 ### Data model
 
 ```sql
--- domains:     fingerprint, raw, first_seen, responsive, technologies, status_code,
---              scheme, error, elapsed_ms, source, checked_at
--- domain_tech: fingerprint, technology, version
+-- domains:      fingerprint, first_seen, checked_at, responsive, is_primary, site,
+--               status_code, scheme, error, elapsed_ms, source
+-- technologies: id, name
+-- domain_tech:  domain_id, tech_id, version      (domain_id is domains.rowid)
+-- tech_counts:  tech_id, domains                 (maintained, never counted)
+-- totals:       name, value                      (maintained, never counted)
+-- frontier:     fingerprint, origin, added
 
-SELECT technology, COUNT(*) FROM domain_tech GROUP BY technology ORDER BY 2 DESC;
+SELECT t.name, c.domains FROM tech_counts c
+  JOIN technologies t ON t.id = c.tech_id ORDER BY c.domains DESC;
 ```
+
+Technology names are interned and pairings are integers, which is what keeps the
+database at 449 bytes a domain rather than 852; the counts a listing needs are
+maintained as rows are written rather than recomputed by scanning. The reasoning,
+the measurements behind it and where the design stops working are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Databases written by earlier versions are migrated automatically on first open.
 
@@ -321,7 +370,7 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-245 tests cover normalisation, fingerprinting, storage and migration, source parsing and
+259 tests cover normalisation, fingerprinting, storage and migration, source parsing and
 caching, certstream against a local websocket server, the query and export layers, the
 threaded runner, the command line, and the desktop interface. Qt tests run on the
 offscreen platform and are skipped when PySide6 is unavailable.

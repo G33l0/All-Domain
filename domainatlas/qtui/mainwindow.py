@@ -50,7 +50,7 @@ from ..engine import Event
 from ..query import ORDER_NEWEST, DomainFilter
 from ..runner import CollectorThread
 from ..sources import available_sources
-from .browser import ExportTask, StoredDomainModel, start_browser
+from .browser import PAGE_SIZE, ExportTask, StoredDomainModel, start_browser
 from .icons import make_icon
 from .logo import logo_icon
 from .models import (
@@ -74,6 +74,19 @@ from .widgets import (
 
 POLL_MS = 250
 MAX_LOG_BLOCKS = 3000
+
+#: Indices of the pages inside the stacked widget, in nav order.
+PAGE_DASHBOARD, PAGE_DOMAINS, PAGE_TECH, PAGE_LOG, PAGE_SETTINGS = range(5)
+
+#: Header title and subtitle per page. Subtitles are kept short enough to read
+#: in full at the smallest supported window width rather than being elided.
+PAGE_HEADINGS = (
+    ("Dashboard", "Live discovery and fingerprinting"),
+    ("Domains", "Every domain stored, searchable"),
+    ("Technologies", "What the live domains run on"),
+    ("Activity log", "Everything the collector reported"),
+    ("Settings", "Applied now, saved to your config"),
+)
 
 
 class MainWindow(QMainWindow):
@@ -209,12 +222,15 @@ class MainWindow(QMainWindow):
         titles.setSpacing(1)
         self.page_title = QLabel("Dashboard")
         self.page_title.setObjectName("pageTitle")
-        self.page_subtitle = ElidingLabel("Live discovery and technology fingerprinting")
+        self.page_subtitle = ElidingLabel(PAGE_HEADINGS[PAGE_DASHBOARD][1])
         self.page_subtitle.setObjectName("pageSubtitle")
         titles.addWidget(self.page_title)
         titles.addWidget(self.page_subtitle)
-        header.addLayout(titles)
-        header.addStretch(1)
+        # The title block takes the free width. Without a stretch factor the
+        # column is only as wide as the page title, and the longer subtitle
+        # underneath it is elided even on a wide window.
+        header.addLayout(titles, 1)
+        header.addSpacing(10)
 
         self.status_pill = StatusPill()
         header.addWidget(self.status_pill)
@@ -319,6 +335,16 @@ class MainWindow(QMainWindow):
         self.filter_network.currentIndexChanged.connect(self._schedule_reload)
         filters.add(self.filter_network)
 
+        self.filter_grouping = QComboBox()
+        for label, value in (("One row per site", True), ("Every host name", False)):
+            self.filter_grouping.addItem(label, value)
+        self.filter_grouping.setToolTip(
+            "Grouped, example.com and www.example.com are one result.\n"
+            "Ungrouped, every host name observed is listed separately."
+        )
+        self.filter_grouping.currentIndexChanged.connect(self._schedule_reload)
+        filters.add(self.filter_grouping)
+
         self.btn_clear_filters = QPushButton("Clear filters")
         self.btn_clear_filters.clicked.connect(self.clear_filters)
         filters.add(self.btn_clear_filters)
@@ -337,7 +363,7 @@ class MainWindow(QMainWindow):
 
     def clear_filters(self) -> None:
         for combo in (self.filter_technology, self.filter_source,
-                      self.filter_status, self.filter_network):
+                      self.filter_status, self.filter_network, self.filter_grouping):
             combo.blockSignals(True)
             combo.setCurrentIndex(0)
             combo.blockSignals(False)
@@ -477,6 +503,12 @@ class MainWindow(QMainWindow):
         self.in_recheck_batch.setRange(1, 100_000)
         self.chk_recheck_only = QCheckBox("Re-check only")
         self.chk_recheck_only.setToolTip("Refresh stored domains without discovering new ones.")
+        self.chk_no_probe = QCheckBox("Record names without visiting them")
+        self.chk_no_probe.setToolTip(
+            "Collect names as fast as the sources produce them, around a hundred\n"
+            "times more per hour. Status and technology columns stay empty until\n"
+            "you turn this off and let the collector work through the backlog."
+        )
         self.chk_tech_files = QCheckBox("Write technology files")
         self.chk_tech_files.setToolTip("Append each live domain to output/<technology>.txt")
         self.chk_unresponsive = QCheckBox("Store unresponsive domains")
@@ -486,6 +518,7 @@ class MainWindow(QMainWindow):
         behaviour_form.addRow("Re-check after", self.in_recheck)
         behaviour_form.addRow("Re-checks per cycle", self.in_recheck_batch)
         behaviour_form.addRow("", self.chk_recheck_only)
+        behaviour_form.addRow("", self.chk_no_probe)
         behaviour_form.addRow("Database", self.in_db)
         behaviour_form.addRow("Output folder", self.in_output)
         behaviour_form.addRow("", self.chk_tech_files)
@@ -559,14 +592,15 @@ class MainWindow(QMainWindow):
         header = table.horizontalHeader()
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(46)
-        table.setColumnWidth(0, 260)
-        table.setColumnWidth(1, 90)
-        table.setColumnWidth(2, 70)
-        table.setColumnWidth(3, 110)
-        table.setColumnWidth(4, 150)
+        table.setColumnWidth(0, 260)  # Domain
+        table.setColumnWidth(1, 56)   # Hosts
+        table.setColumnWidth(2, 90)   # Status
+        table.setColumnWidth(3, 70)   # HTTP
+        table.setColumnWidth(4, 110)  # Source
+        table.setColumnWidth(5, 150)  # First seen
         delegate = StatusDotDelegate(StoredDomainModel.ROLE_RESPONSIVE,
                                      self.palette_.success, self.palette_.text_faint, table)
-        table.setItemDelegateForColumn(1, delegate)
+        table.setItemDelegateForColumn(2, delegate)
         table.status_delegate = delegate
         return table
 
@@ -664,6 +698,7 @@ class MainWindow(QMainWindow):
             source=self.filter_source.currentData(),
             responsive=self.filter_status.currentData(),
             onion=self.filter_network.currentData(),
+            sites_only=bool(self.filter_grouping.currentData()),
         )
 
     def _schedule_reload(self) -> None:
@@ -687,18 +722,19 @@ class MainWindow(QMainWindow):
     def _update_result_label(self) -> None:
         loaded = self.stored_model.loaded_count()
         total = self.stored_model.total
+        noun = "sites" if self.stored_model.filter.sites_only else "domains"
         if loaded and not getattr(self, "_counted", False):
-            self.result_label.setText(f"Showing {loaded:,} domains, counting…")
+            self.result_label.setText(f"Showing {loaded:,} {noun}, counting…")
             return
         if total == 0 and loaded == 0:
             criteria = self.current_filter()
             self.result_label.setText(
-                "No domains match this filter." if not criteria.is_empty()
+                f"No {noun} match this filter." if not criteria.is_empty()
                 else "No domains stored yet - press Start to begin collecting."
             )
             return
         total_text = f"{total:,}+" if self.stored_model.total_capped else f"{total:,}"
-        self.result_label.setText(f"Showing {loaded:,} of {total_text} matching domains")
+        self.result_label.setText(f"Showing {loaded:,} of {total_text} matching {noun}")
 
     @Slot(list, list)
     def _on_facets(self, technologies: list, sources: list) -> None:
@@ -754,15 +790,13 @@ class MainWindow(QMainWindow):
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
         self.pages.setCurrentIndex(index)
-        titles = [
-            ("Dashboard", "Live discovery and technology fingerprinting"),
-            ("Domains", "Everything stored, searchable and filterable"),
-            ("Technologies", "What the live domains are built with"),
-            ("Activity log", "Everything the collector reported"),
-            ("Settings", "Applied to this run and saved to your config file"),
-        ]
+        titles = PAGE_HEADINGS
         self.page_title.setText(titles[index][0])
         self.page_subtitle.setText(titles[index][1])
+        if index in (PAGE_DOMAINS, PAGE_TECH) and getattr(self, "_state", "") == "running":
+            if index == PAGE_DOMAINS:
+                self._auto_refresh_stored()
+            self.request_summary.emit()
 
     def on_start(self) -> None:
         if self.collector.running:
@@ -883,6 +917,7 @@ class MainWindow(QMainWindow):
         self.in_recheck.setValue(config.recheck_after)
         self.in_recheck_batch.setValue(config.recheck_batch)
         self.chk_recheck_only.setChecked(config.recheck_only)
+        self.chk_no_probe.setChecked(not config.probe_domains)
         self.chk_tech_files.setChecked(config.write_tech_files)
         self.chk_unresponsive.setChecked(config.store_unresponsive)
         self.chk_verify_ssl.setChecked(config.verify_ssl)
@@ -905,6 +940,7 @@ class MainWindow(QMainWindow):
         candidate.recheck_after = self.in_recheck.value()
         candidate.recheck_batch = self.in_recheck_batch.value()
         candidate.recheck_only = self.chk_recheck_only.isChecked()
+        candidate.probe_domains = not self.chk_no_probe.isChecked()
         candidate.write_tech_files = self.chk_tech_files.isChecked()
         candidate.store_unresponsive = self.chk_unresponsive.isChecked()
         candidate.verify_ssl = self.chk_verify_ssl.isChecked()
@@ -940,6 +976,22 @@ class MainWindow(QMainWindow):
         except ConfigError as exc:
             QMessageBox.warning(self, "Settings not saved", str(exc))
 
+    def _auto_refresh_stored(self) -> None:
+        """Pull newly stored domains into the Domains page during a run.
+
+        Only done when it cannot disturb what the user is looking at: the
+        page has to be on screen, scrolled to the top, and showing no more
+        than the first page of results.
+        """
+        if self.pages.currentIndex() != PAGE_DOMAINS:
+            return
+        if self.stored_table.verticalScrollBar().value() != 0:
+            return
+        if self.stored_model.loaded_count() > PAGE_SIZE:
+            return
+        self.reload_stored()
+        self.request_facets.emit()
+
     # ------------------------------------------------------------------ pump
     def _pump(self) -> None:
         try:
@@ -955,6 +1007,7 @@ class MainWindow(QMainWindow):
             self._refresh_tick = getattr(self, "_refresh_tick", 0) + 1
             if self._state == "running" and self._refresh_tick % 40 == 0:
                 self.request_summary.emit()
+                self._auto_refresh_stored()
         except Exception as exc:  # pragma: no cover - the UI must never die
             self.log(f"UI error: {type(exc).__name__}: {exc}", "ERROR")
 
@@ -1091,9 +1144,11 @@ class MainWindow(QMainWindow):
         thread = getattr(self, "browser_thread", None)
         if thread is None:
             return
-        browser = getattr(self, "browser", None)
-        if browser is not None:
-            browser.close()
         thread.quit()
-        thread.wait(5000)
+        stopped = thread.wait(5000)
+        browser = getattr(self, "browser", None)
+        # Close the connection only once the thread that owns it has finished,
+        # otherwise a query still in flight reads from a closed handle.
+        if browser is not None and stopped:
+            browser.close()
         self.browser_thread = None

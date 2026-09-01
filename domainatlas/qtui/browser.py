@@ -131,7 +131,7 @@ class DatabaseBrowser(QObject):
 class StoredDomainModel(QAbstractTableModel):
     """Incrementally loaded view of the stored domains."""
 
-    COLUMNS = ("Domain", "Status", "HTTP", "Source", "First seen", "Technologies")
+    COLUMNS = ("Domain", "Hosts", "Status", "HTTP", "Source", "First seen", "Technologies")
     ROLE_RESPONSIVE = int(Qt.ItemDataRole.UserRole) + 1
 
     request_page = Signal(int, object, object, str)
@@ -173,20 +173,25 @@ class StoredDomainModel(QAbstractTableModel):
             if column == 0:
                 return row.fingerprint
             if column == 1:
-                return "Live" if row.responsive else "Down"
+                return str(row.variants) if row.variants > 1 else "-"
             if column == 2:
-                return str(row.status_code) if row.status_code is not None else "-"
+                return "Live" if row.responsive else "Down"
             if column == 3:
-                return row.source or "-"
+                return str(row.status_code) if row.status_code is not None else "-"
             if column == 4:
-                return (row.first_seen or "")[:19]
+                return row.source or "-"
             if column == 5:
+                return (row.first_seen or "")[:19]
+            if column == 6:
                 return ", ".join(row.technologies) if row.technologies else "-"
         if role == Qt.ItemDataRole.ToolTipRole:
             detail = ", ".join(row.technologies) or "no technologies detected"
             error = f"\nError: {row.error}" if row.error else ""
-            return f"{row.fingerprint}\n{detail}{error}"
-        if role == Qt.ItemDataRole.TextAlignmentRole and column in (1, 2):
+            others = ""
+            if row.variants > 1:
+                others = f"\n{row.variants - 1} more host name(s) under {row.site}"
+            return f"{row.fingerprint}\n{detail}{error}{others}"
+        if role == Qt.ItemDataRole.TextAlignmentRole and column in (1, 2, 3):
             return int(Qt.AlignmentFlag.AlignCenter)
         return None
 

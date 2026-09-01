@@ -1,42 +1,41 @@
+import asyncio
 import sqlite3
 
 import pytest
 
+from domainatlas.store import DomainRecord, DomainStore
 from domainatlas.query import ORDER_NAME, DomainFilter, DomainQuery, QueryError
 
 
 @pytest.fixture
 def database(tmp_path):
+    """A database built by the store itself, so the schema cannot drift."""
     path = str(tmp_path / "atlas.db")
-    connection = sqlite3.connect(path)
-    connection.executescript(
-        """
-        CREATE TABLE domains (
-            fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL,
-            first_seen TIMESTAMP, responsive INTEGER NOT NULL DEFAULT 0,
-            technologies TEXT, status_code INTEGER, scheme TEXT, error TEXT,
-            elapsed_ms INTEGER, source TEXT, checked_at TIMESTAMP);
-        CREATE TABLE domain_tech (
-            fingerprint TEXT NOT NULL, technology TEXT NOT NULL, version TEXT,
-            PRIMARY KEY (fingerprint, technology));
-        """
-    )
     rows = [
-        ("a.example", 1, 200, "tranco", '["Nginx", "React"]', "2026-01-01 00:00:00"),
-        ("b.example", 1, 200, "crtsh", '["Nginx"]', "2026-01-02 00:00:00"),
-        ("c.example", 0, None, "crtsh", None, "2026-01-03 00:00:00"),
-        ("d" * 56 + ".onion", 0, None, "onion", None, "2026-01-04 00:00:00"),
+        ("a.example", True, 200, "tranco", ["Nginx", "React"], "2026-01-01 00:00:00"),
+        ("b.example", True, 200, "crtsh", ["Nginx"], "2026-01-02 00:00:00"),
+        ("c.example", False, None, "crtsh", [], "2026-01-03 00:00:00"),
+        ("d" * 56 + ".onion", False, None, "onion", [], "2026-01-04 00:00:00"),
     ]
-    for fingerprint, responsive, status, source, technologies, seen in rows:
+
+    async def build():
+        async with DomainStore(path, write_tech_files=False) as store:
+            for fingerprint, responsive, status, source, technologies, _seen in rows:
+                await store.add(DomainRecord(
+                    fingerprint=fingerprint, responsive=responsive, status_code=status,
+                    source=source, technologies=list(technologies),
+                    versions={"Nginx": "1.24"} if fingerprint == "a.example" else {},
+                ))
+            await store.flush()
+
+    asyncio.run(build())
+    # Fixed timestamps keep the ordering assertions deterministic.
+    connection = sqlite3.connect(path)
+    for fingerprint, _r, _s, _src, _t, seen in rows:
         connection.execute(
-            "INSERT INTO domains (fingerprint, raw, responsive, status_code, source, "
-            "technologies, first_seen, checked_at) VALUES (?,?,?,?,?,?,?,?)",
-            (fingerprint, fingerprint, responsive, status, source, technologies, seen, seen),
+            "UPDATE domains SET first_seen = ?, checked_at = ? WHERE fingerprint = ?",
+            (seen, seen, fingerprint),
         )
-    connection.executemany(
-        "INSERT INTO domain_tech VALUES (?,?,?)",
-        [("a.example", "Nginx", "1.24"), ("a.example", "React", None), ("b.example", "Nginx", None)],
-    )
     connection.commit()
     connection.close()
     return path

@@ -40,8 +40,8 @@ async def store(tmp_path):
 
 
 async def test_add_and_dedupe(store):
-    assert await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"], versions={"Nginx": "1.2"}))
-    assert not await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
+    assert await store.add(DomainRecord("a.com", True, ["Nginx"], versions={"Nginx": "1.2"}))
+    assert not await store.add(DomainRecord("a.com", True, ["Nginx"]))
     assert store.is_known("a.com")
     assert store.known_count == 1
 
@@ -54,9 +54,9 @@ async def test_reserve_prevents_double_queueing(store):
 
 
 async def test_flush_writes_rows_and_tech_files(tmp_path, store):
-    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx", "WordPress"],
+    await store.add(DomainRecord("a.com", True, ["Nginx", "WordPress"],
                                  versions={"Nginx": "1.24.0"}, status_code=200, scheme="https"))
-    await store.add(DomainRecord("down.com", "down.com", False, [], error="timeout"))
+    await store.add(DomainRecord("down.com", False, [], error="timeout"))
     assert await store.flush() == 0 or True  # already flushed by summary below
     summary = await store.summary()
     assert summary == {"total": 2, "responsive": 1, "technologies": 2}
@@ -69,18 +69,21 @@ async def test_flush_writes_rows_and_tech_files(tmp_path, store):
 
 
 async def test_top_technologies_and_export(store):
-    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
-    await store.add(DomainRecord("b.com", "b.com", True, ["Nginx", "React"]))
+    await store.add(DomainRecord("a.com", True, ["Nginx"]))
+    await store.add(DomainRecord("b.com", True, ["Nginx", "React"]))
     assert await store.top_technologies() == [("Nginx", 2), ("React", 1)]
     assert await store.domains_for_technology("Nginx") == ["a.com", "b.com"]
     assert await store.domains_for_technology("Nope") == []
 
 
 async def test_versions_are_persisted(tmp_path, store):
-    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"], versions={"Nginx": "1.24.0"}))
+    await store.add(DomainRecord("a.com", True, ["Nginx"], versions={"Nginx": "1.24.0"}))
     await store.flush()
     with sqlite3.connect(store.db_path) as conn:
-        row = conn.execute("SELECT technology, version FROM domain_tech").fetchone()
+        row = conn.execute(
+            "SELECT t.name, dt.version FROM domain_tech dt "
+            "JOIN technologies t ON t.id = dt.tech_id"
+        ).fetchone()
     assert row == ("Nginx", "1.24.0")
 
 
@@ -88,14 +91,14 @@ async def test_known_fingerprints_survive_a_restart(tmp_path):
     db = str(tmp_path / "d.db")
     first = DomainStore(db, str(tmp_path / "out"))
     await first.open()
-    await first.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
+    await first.add(DomainRecord("a.com", True, ["Nginx"]))
     await first.close()
 
     second = DomainStore(db, str(tmp_path / "out"))
     await second.open()
     try:
         assert second.is_known("a.com")
-        assert not await second.add(DomainRecord("a.com", "a.com", True, []))
+        assert not await second.add(DomainRecord("a.com", True, []))
     finally:
         await second.close()
 
@@ -117,7 +120,7 @@ async def test_migrates_a_version_1_database(tmp_path):
     await store.open()
     try:
         assert store.is_known("old.com")
-        assert await store.add(DomainRecord("new.com", "new.com", True, ["React"]))
+        assert await store.add(DomainRecord("new.com", True, ["React"]))
         summary = await store.summary()
         assert summary["total"] == 2
     finally:
@@ -125,7 +128,7 @@ async def test_migrates_a_version_1_database(tmp_path):
 
 
 async def test_tech_file_names_are_sanitised(tmp_path, store):
-    await store.add(DomainRecord("a.com", "a.com", True, ["../../evil"]))
+    await store.add(DomainRecord("a.com", True, ["../../evil"]))
     await store.flush()
     files = [path.name for path in (tmp_path / "out").iterdir()]
     assert files == ["evil.txt"]
@@ -135,7 +138,7 @@ async def test_write_tech_files_can_be_disabled(tmp_path):
     store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"), write_tech_files=False)
     await store.open()
     try:
-        await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
+        await store.add(DomainRecord("a.com", True, ["Nginx"]))
         await store.flush()
     finally:
         await store.close()
@@ -143,7 +146,7 @@ async def test_write_tech_files_can_be_disabled(tmp_path):
 
 
 async def test_stale_domains_respects_the_cutoff(store):
-    await store.add(DomainRecord("fresh.com", "fresh.com", True, ["Nginx"]))
+    await store.add(DomainRecord("fresh.com", True, ["Nginx"]))
     await store.flush()
     assert await store.stale_domains(3600, 10) == []
 
@@ -157,7 +160,7 @@ async def test_stale_domains_respects_the_cutoff(store):
 
 async def test_stale_domains_are_ordered_oldest_first(store):
     for name in ("a.com", "b.com"):
-        await store.add(DomainRecord(name, name, True, []))
+        await store.add(DomainRecord(name, True, []))
     await store.flush()
     with sqlite3.connect(store.db_path) as conn:
         conn.execute("UPDATE domains SET checked_at = '2001-01-01 00:00:00' WHERE fingerprint = 'a.com'")
@@ -167,10 +170,10 @@ async def test_stale_domains_are_ordered_oldest_first(store):
 
 
 async def test_recheck_updates_the_row_instead_of_inserting(store):
-    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"],
+    await store.add(DomainRecord("a.com", True, ["Nginx"],
                                  versions={"Nginx": "1.0"}, status_code=200))
     await store.flush()
-    assert await store.add(DomainRecord("a.com", "a.com", False, [], status_code=503,
+    assert await store.add(DomainRecord("a.com", False, [], status_code=503,
                                         error="HTTP 503", recheck=True))
     await store.flush()
 
@@ -183,17 +186,17 @@ async def test_recheck_updates_the_row_instead_of_inserting(store):
 
 
 async def test_recheck_replaces_the_technology_set(store):
-    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
+    await store.add(DomainRecord("a.com", True, ["Nginx"]))
     await store.flush()
-    await store.add(DomainRecord("a.com", "a.com", True, ["Apache", "React"], recheck=True))
+    await store.add(DomainRecord("a.com", True, ["Apache", "React"], recheck=True))
     await store.flush()
     assert await store.top_technologies() == [("Apache", 1), ("React", 1)]
 
 
 async def test_recheck_does_not_duplicate_technology_file_lines(tmp_path, store):
-    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx"]))
+    await store.add(DomainRecord("a.com", True, ["Nginx"]))
     await store.flush()
-    await store.add(DomainRecord("a.com", "a.com", True, ["Nginx", "React"], recheck=True))
+    await store.add(DomainRecord("a.com", True, ["Nginx", "React"], recheck=True))
     await store.flush()
     assert (tmp_path / "out" / "Nginx.txt").read_text() == "a.com\n"
     assert (tmp_path / "out" / "React.txt").read_text() == "a.com\n"
@@ -203,7 +206,7 @@ async def test_checked_at_is_utc(store):
     """stale_domains() compares against a UTC cutoff, so writes must be UTC."""
     import datetime
 
-    await store.add(DomainRecord("a.com", "a.com", True, []))
+    await store.add(DomainRecord("a.com", True, []))
     stamp = await store.last_checked("a.com")
     written = datetime.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
     now = datetime.datetime.utcnow()
@@ -235,7 +238,7 @@ async def test_buffered_records_survive_a_lost_connection(tmp_path):
     await store.open()
     connection, store._db = store._db, None
     try:
-        await store.add(DomainRecord("keep.example", "keep.example", True, []))
+        await store.add(DomainRecord("keep.example", True, []))
         assert await store.flush() == 0
         assert [record.fingerprint for record in store._pending] == ["keep.example"]
     finally:
@@ -250,7 +253,7 @@ async def test_duplicates_are_rejected_beyond_the_cache(tmp_path):
     await store.open()
     try:
         for index in range(5):
-            await store.add(DomainRecord(f"d{index}.example", f"d{index}.example", True, []))
+            await store.add(DomainRecord(f"d{index}.example", True, []))
         await store.flush()
         assert len(store._seen) <= 2          # cache is bounded
         assert store.known_count == 5         # but the count is the real total
@@ -276,7 +279,7 @@ async def test_cache_is_warmed_from_the_database(tmp_path):
     path = str(tmp_path / "d.db")
     first = DomainStore(path, str(tmp_path / "out"))
     await first.open()
-    await first.add(DomainRecord("warm.example", "warm.example", True, []))
+    await first.add(DomainRecord("warm.example", True, []))
     await first.close()
 
     second = DomainStore(path, str(tmp_path / "out"))
@@ -332,7 +335,7 @@ async def test_frontier_skips_domains_already_stored(tmp_path):
     store = DomainStore(str(tmp_path / "d.db"), str(tmp_path / "out"))
     await store.open()
     try:
-        await store.add(DomainRecord("known.example", "known.example", True, []))
+        await store.add(DomainRecord("known.example", True, []))
         await store.flush()
         assert await store.push_frontier(["known.example", "fresh.example"]) == 1
         assert await store.take_frontier(10) == ["fresh.example"]
@@ -377,3 +380,146 @@ async def test_frontier_survives_a_restart(tmp_path):
         assert await second.take_frontier(10) == ["persist.example"]
     finally:
         await second.close()
+
+
+@pytest.mark.asyncio
+async def test_host_variants_collapse_to_one_site(tmp_path):
+    """f-milano.net and www.f-milano.net must not read as two results."""
+    from domainatlas.query import DomainFilter, DomainQuery
+
+    path = tmp_path / "sites.db"
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        for host in ("www.f-milano.net", "f-milano.net", "mail.f-milano.net",
+                     "other.example.com"):
+            await store.add(DomainRecord(fingerprint=host, responsive=True))
+        await store.flush()
+
+    query = DomainQuery(str(path)).open()
+    try:
+        assert query.supports_sites is True
+        every_host = query.page(DomainFilter(), limit=50)
+        grouped = query.page(DomainFilter(sites_only=True), limit=50)
+        assert len(every_host) == 4
+        names = sorted(row.fingerprint for row in grouped)
+        assert names == ["f-milano.net", "other.example.com"]
+        milano = next(row for row in grouped if row.site == "f-milano.net")
+        assert milano.variants == 3
+        assert query.count(DomainFilter(sites_only=True)) == (2, False)
+    finally:
+        query.close()
+
+
+@pytest.mark.asyncio
+async def test_a_later_apex_takes_over_as_the_site_representative(tmp_path):
+    """The shortest name wins however late it turns up."""
+    from domainatlas.query import DomainFilter, DomainQuery
+
+    path = tmp_path / "late.db"
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        await store.add(DomainRecord(fingerprint="www.late.test"))
+        await store.flush()
+        await store.add(DomainRecord(fingerprint="late.test"))
+        await store.flush()
+
+    query = DomainQuery(str(path)).open()
+    try:
+        grouped = query.page(DomainFilter(sites_only=True), limit=50)
+        assert [row.fingerprint for row in grouped] == ["late.test"]
+        assert grouped[0].variants == 2
+    finally:
+        query.close()
+
+
+@pytest.mark.asyncio
+async def test_a_database_from_an_older_release_gains_sites_on_open(tmp_path):
+    import sqlite3
+
+    from domainatlas.query import DomainFilter, DomainQuery
+
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(
+        """
+        CREATE TABLE domains (
+            fingerprint TEXT PRIMARY KEY, raw TEXT NOT NULL, first_seen TIMESTAMP,
+            responsive INTEGER NOT NULL DEFAULT 0, technologies TEXT,
+            status_code INTEGER, scheme TEXT, error TEXT, elapsed_ms INTEGER,
+            source TEXT, checked_at TIMESTAMP);
+        INSERT INTO domains (fingerprint, raw, first_seen, responsive)
+        VALUES ('www.old.test', 'www.old.test', '2026-01-01 00:00:00', 1),
+               ('old.test', 'old.test', '2026-01-01 00:00:01', 1);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    # Read-only handles cannot migrate, so grouping is dropped rather than failing.
+    before = DomainQuery(str(path)).open()
+    try:
+        assert before.supports_sites is False
+        assert len(before.page(DomainFilter(sites_only=True), limit=10)) == 2
+    finally:
+        before.close()
+
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        assert store is not None
+
+    after = DomainQuery(str(path)).open()
+    try:
+        assert after.supports_sites is True
+        rows = after.page(DomainFilter(sites_only=True), limit=10)
+        assert [row.fingerprint for row in rows] == ["old.test"]
+        assert rows[0].variants == 2
+    finally:
+        after.close()
+
+
+@pytest.mark.asyncio
+async def test_totals_are_maintained_not_counted(tmp_path):
+    """The dashboard must not scan the table to show three numbers."""
+    from domainatlas.query import DomainQuery
+
+    path = tmp_path / "totals.db"
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        for index in range(6):
+            await store.add(DomainRecord(f"d{index}.example", index % 2 == 0, ["Nginx"]))
+        await store.add(DomainRecord("a" * 56 + ".onion", False, []))
+        await store.flush()
+        summary = await store.summary()
+        assert summary == {"total": 7, "responsive": 3, "technologies": 1}
+
+        # A re-check that flips a domain moves the counter with it.
+        await store.add(DomainRecord("d1.example", True, ["Nginx"], recheck=True))
+        await store.flush()
+        assert (await store.summary())["responsive"] == 4
+        await store.add(DomainRecord("d0.example", False, [], recheck=True))
+        await store.flush()
+        assert (await store.summary())["responsive"] == 3
+
+    query = DomainQuery(str(path)).open()
+    try:
+        counted = query.connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(responsive), 0), "
+            "COALESCE(SUM(fingerprint LIKE '%.onion'), 0) FROM domains"
+        ).fetchone()
+        assert query.summary() == {
+            "total": counted[0], "responsive": counted[1],
+            "technologies": 1, "onion": counted[2],
+        }
+    finally:
+        query.close()
+
+
+@pytest.mark.asyncio
+async def test_technology_counts_follow_a_recheck(tmp_path):
+    """A technology that disappears between checks must leave the histogram."""
+    path = tmp_path / "counts.db"
+    async with DomainStore(str(path), write_tech_files=False) as store:
+        await store.add(DomainRecord("x.example", True, ["Nginx", "React"]))
+        await store.add(DomainRecord("y.example", True, ["Nginx"]))
+        await store.flush()
+        assert dict(await store.top_technologies(10)) == {"Nginx": 2, "React": 1}
+
+        await store.add(DomainRecord("x.example", True, ["Apache"], recheck=True))
+        await store.flush()
+        assert dict(await store.top_technologies(10)) == {"Nginx": 1, "Apache": 1}

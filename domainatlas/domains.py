@@ -95,12 +95,55 @@ def is_valid_domain(raw: object) -> bool:
     return normalize_domain(raw) is not None
 
 
+#: Suffixes under which every name belongs to a different owner. Grouping by
+#: the last two labels would file all of GitHub Pages under one site, so these
+#: take one label more. The list covers the hosts that dominate certificate
+#: transparency output; anything missing degrades to the two-label rule, which
+#: is the behaviour this list improves on rather than depends on.
+MULTI_LABEL_SUFFIXES = frozenset((
+    "amazonaws.com", "appspot.com", "azurewebsites.net", "blogspot.com",
+    "cloudfront.net", "cloudfunctions.net", "elasticbeanstalk.com",
+    "firebaseapp.com", "fly.dev", "github.io", "gitlab.io", "herokuapp.com",
+    "netlify.app", "ngrok.io", "onrender.com", "pages.dev", "r2.dev",
+    "readthedocs.io", "repl.co", "sharepoint.com", "shopify.com",
+    "squarespace.com", "trycloudflare.com", "vercel.app", "web.app",
+    "webflow.io", "wixsite.com", "wordpress.com", "workers.dev",
+))
+
+
 def registrable_suffix(domain: str) -> str:
     """Best-effort public suffix (last two labels, or three for ``co.uk`` style)."""
     labels = domain.split(".")
     if len(labels) >= 3 and len(labels[-2]) <= 3 and len(labels[-1]) <= 3:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
+
+
+def site_of(domain: str) -> str:
+    """The name that ``domain`` belongs to, used to group host variants.
+
+    ``example.com`` and ``www.example.com`` are one site, so a listing shows
+    them once instead of twice.  Hosting suffixes that hand out names to
+    unrelated owners keep the label that identifies the owner.
+    """
+    if not domain:
+        return ""
+    labels = domain.split(".")
+    if len(labels) < 3:
+        return domain
+    for depth in (3, 2):
+        if len(labels) > depth and ".".join(labels[-depth:]) in MULTI_LABEL_SUFFIXES:
+            return ".".join(labels[-(depth + 1):])
+    return registrable_suffix(domain)
+
+
+def site_rank(domain: str) -> tuple:
+    """Sort key picking which host represents a site: shortest, then a-z.
+
+    The apex always wins over ``www.`` and over any other subdomain, and the
+    choice does not change as more variants arrive.
+    """
+    return (domain.count("."), len(domain), domain)
 
 
 def iter_normalized(values: Iterable[object]) -> Iterator[str]:
